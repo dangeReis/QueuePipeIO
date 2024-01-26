@@ -4,7 +4,7 @@ import pypandoc
 long_description = pypandoc.convert('README.md', 'rst')
 setup(
     name='queuebytesio',
-    version='0.1.5',
+    version='0.1.6',
     description='A project that provides queue-based I/O functionality',
     packages=find_packages(),
     install_requires=[
