@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='queuebytesio',
-    version='0.1.2',
+    version='0.1.3',
     description='A project that provides queue-based I/O functionality',
     packages=find_packages(),
     install_requires=[
