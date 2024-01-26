@@ -1,10 +1,10 @@
 from setuptools import setup, find_packages
 import pypandoc
 
-long_description = pypandoc.convert('README.md', 'rst')
+long_description = pypandoc.convert_file('README.md', 'rst')
 setup(
     name='queuebytesio',
-    version='0.1.6',
+    version='0.1.7',
     description='A project that provides queue-based I/O functionality',
     packages=find_packages(),
     install_requires=[
