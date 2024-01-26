@@ -101,6 +101,9 @@ class QueueIO(io.RawIOBase):
 
     def close(self):
         """Close the queue"""
+        if len(self._write_buffer) > 0:  # If there's remaining data in the write buffer
+            self._queue.put(self._write_buffer)  # Put the remaining data into the queue
+            self._write_buffer = b''  # Clear the write buffer
         self._queue.put(None)  # Put None in the queue to signal that it's closed
         super().close()
 
