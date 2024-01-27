@@ -1,12 +1,12 @@
 import unittest
-from queuebytesio import QueueIO, LimitedQueueIO
+from queuepipeio import QueueIO, LimitedQueueIO  # Updated import statements
 import threading
 
 MB=1024*1024
 
 class TestQueueIO(unittest.TestCase):
     def setUp(self):
-        self.qio = QueueIO()
+        self.qio = QueueIO()  # Updated class name
 
     def test_write(self):
         self.assertEqual(self.qio.write(b'Hello, world!'), 13)
@@ -25,7 +25,7 @@ class TestQueueIO(unittest.TestCase):
 
 class TestLimitedQueueIO(unittest.TestCase):
     def setUp(self):
-        self.lqio = LimitedQueueIO(memory_limit=16*MB, chunk_size=8*MB)
+        self.lqio = LimitedQueueIO(memory_limit=16*MB, chunk_size=8*MB)  # Updated class name
 
     def test_write(self):
         self.assertEqual(self.lqio.write(b'Hello, again!'), 13)

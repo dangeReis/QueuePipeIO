@@ -1,50 +1,50 @@
-# QueueIO and LimitedQueueIO
+# QueuePipeIO and LimitedQueuePipeIO
 
-This Python package provides two classes, `QueueIO` and `LimitedQueueIO`, that represent queue-based I/O objects. These classes are ideal for multi-threaded or asynchronous programming where data is produced in one thread or coroutine and consumed in another.
+This Python package provides two classes, `QueuePipeIO` and `LimitedQueuePipeIO`, that represent queue-based I/O objects. These classes are ideal for multi-threaded or asynchronous programming where data is produced in one thread or coroutine and consumed in another.
 
 ## Installation
 
 You can install this package from PyPI:
 
 ```
-pip install queue_bytes_io
+pip install queuepipeio
 ```
 
 ## Usage
 
-Here's a basic example of how to use `QueueIO` and `LimitedQueueIO`:
+Here's a basic example of how to use `QueuePipeIO` and `LimitedQueuePipeIO`:
 
 ```python
-from queuebytesio import QueueIO, LimitedQueueIO
+from queuepipeio import QueuePipeIO, LimitedQueuePipeIO
 
 # Define MB as a constant
 MB = 1024 * 1024
 
-# Create a QueueIO object
-qbio = QueueIO(chunk_size=8*MB)
+# Create a QueuePipeIO object
+qpio = QueuePipeIO(chunk_size=8*MB)
 
 # Write data to the queue
-qbio.write(b'Hello, world!')
+qpio.write(b'Hello, world!')
 
 # Close the writer
-qbio.close()
+qpio.close()
 
 # Read data from the queue
-data = qbio.read()
+data = qpio.read()
 
 print(data)  # Outputs: b'Hello, world!'
 
-# Create a LimitedQueueIO object with a memory limit
-lqbio = LimitedQueueIO(memory_limit=16*MB, chunk_size=8*MB)
+# Create a LimitedQueuePipeIO object with a memory limit
+lqpio = LimitedQueuePipeIO(memory_limit=16*MB, chunk_size=8*MB)
 
 # Write data to the queue
-lqbio.write(b'Hello, again!')
+lqpio.write(b'Hello, again!')
 
 # Close the writer
-lqbio.close()
+lqpio.close()
 
 # Read data from the queue
-data = lqbio.read()
+data = lqpio.read()
 
 print(data)  # Outputs: b'Hello, again!'
 ```
