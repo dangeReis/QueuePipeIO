@@ -4,7 +4,7 @@ import pypandoc
 long_description = pypandoc.convert_file('README.md', 'rst')
 setup(
     name='queuepipeio',  # Updated package name
-    version='0.1.8',
+    version='0.1.11',
     description='A project that provides queue-based I/O functionality',
     packages=find_packages(),
     install_requires=[
@@ -16,7 +16,8 @@ setup(
         'Development Status :: 3 - Alpha',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: Apache Software License',
-        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.11',
     ],
-    long_description=long_description,
+    long_description=long_description, 
+    long_description_content_type='text/x-rst'
 )
