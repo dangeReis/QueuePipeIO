@@ -25,7 +25,6 @@ jobs:
       run: |
         git config --global user.email "Bump2Version@localhost"
         git config --global user.name "Bump2Version Bot"
-
     - name: Bump up version number
       run: |
         pip install bump2version
@@ -47,6 +46,3 @@ jobs:
       with:
         user: __token__
         password: ${{ secrets.PYPI_API_TOKEN }}  # Use OIDC token as the default password
-        author: ${{ steps.get_author.outputs.author }}
-        email: ${{ steps.get_author.outputs.email }}
-
