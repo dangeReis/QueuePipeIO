@@ -1,4 +1,4 @@
-.PHONY: test lint fmt check clean localstack-start localstack-stop localstack-status localstack-logs test-s3
+hi.PHONY: test lint fmt check clean localstack-start localstack-stop localstack-status localstack-logs test-s3
 
 # Python command that uses venv if available, otherwise python3
 PYTHON := $(shell if [ -d venv ] && [ -f venv/bin/python ]; then echo venv/bin/python; else echo python3; fi)

@@ -52,8 +52,11 @@ class QueueIO(io.RawIOBase):
         )
         self._chunk_size = chunk_size  # Size of the chunks to put into the queue
         self._write_timeout = write_timeout  # Timeout for write operations
-        self._lock = threading.Lock()  # Lock for thread-safe buffer operations
-        self._closed = False  # Track closed state
+        self._read_lock = threading.Lock()  # Lock for read buffer operations
+        self._write_lock = threading.Lock()  # Lock for write buffer operations
+        self._write_closed = False  # Track if writing is closed
+        self._read_closed = False  # Track if reading is closed
+        self._fully_closed = False  # Track if both sides are closed
 
     def write(self, b):
         """
@@ -70,18 +73,18 @@ class QueueIO(io.RawIOBase):
                 f"a bytes-like object is required, not '{type(b).__name__}'"
             )
 
-        with self._lock:
+        with self._write_lock:
             # Check closed state while holding the lock to prevent race condition
-            if self._closed:
+            if self._write_closed:
                 raise ValueError("I/O operation on closed file")
-                
+
             self._write_buffer += b
             while len(self._write_buffer) >= self._chunk_size:
                 chunk, self._write_buffer = (
                     self._write_buffer[: self._chunk_size],
                     self._write_buffer[self._chunk_size :],
                 )
-                
+
                 # Retry logic with exponential backoff for queue.Full
                 if self._write_timeout is None:
                     # No timeout specified, just put normally
@@ -92,35 +95,40 @@ class QueueIO(io.RawIOBase):
                     max_retries = 3  # Reduced number of retries
                     base_timeout = 0.01  # Shorter base timeout
                     total_elapsed = 0.0
-                    
+
                     while total_elapsed < self._write_timeout:
                         try:
                             # Calculate remaining timeout
                             remaining_timeout = self._write_timeout - total_elapsed
                             if remaining_timeout <= 0:
                                 break
-                            
+
                             # Use exponential backoff, but cap at remaining timeout
-                            timeout = min(remaining_timeout, base_timeout * (2 ** retry_count))
+                            timeout = min(
+                                remaining_timeout, base_timeout * (2**retry_count)
+                            )
                             start_time = time.time()
-                            
+
                             self._queue.put(chunk, block=True, timeout=timeout)
                             break  # Success, exit retry loop
                         except queue.Full:
                             elapsed = time.time() - start_time
                             total_elapsed += elapsed
-                            
-                            if self._closed:
+
+                            if self._write_closed:
                                 # If we're closed, don't keep retrying
                                 self._write_buffer = chunk + self._write_buffer
                                 raise ValueError("I/O operation on closed file")
-                            
+
                             retry_count += 1
-                            if retry_count >= max_retries or total_elapsed >= self._write_timeout:
+                            if (
+                                retry_count >= max_retries
+                                or total_elapsed >= self._write_timeout
+                            ):
                                 # No more retries, re-add chunk and raise
                                 self._write_buffer = chunk + self._write_buffer
                                 raise
-                            
+
                             # Continue retrying
                             continue
         return len(b)
@@ -139,21 +147,24 @@ class QueueIO(io.RawIOBase):
         if n == 0:
             return b""
 
-        with self._lock:
+        if self._read_closed:
+            raise ValueError("I/O operation on closed file")
+
+        with self._read_lock:
             # If we have enough data in buffer, return it immediately
             if n != -1 and len(self._buffer) >= n:
                 data, self._buffer = self._buffer[:n], self._buffer[n:]
                 return data
 
         while True:
-            with self._lock:
+            with self._read_lock:
                 # Check if we have enough data now
                 if n != -1 and len(self._buffer) >= n:
                     data, self._buffer = self._buffer[:n], self._buffer[n:]
                     return data
 
                 # Check if we should return what we have
-                if self._closed and self._queue.empty():
+                if self._write_closed and self._queue.empty():
                     data = self._buffer
                     self._buffer = b""
                     return data
@@ -162,18 +173,18 @@ class QueueIO(io.RawIOBase):
                 # Use timeout instead of polling with sleep
                 data = self._queue.get(timeout=0.1)
                 if data is None:  # EOF marker
-                    with self._lock:
+                    with self._read_lock:
                         result = self._buffer
                         self._buffer = b""
-                        self._closed = True
+                        self._write_closed = True  # Writer has closed
                     return result
                 else:
-                    with self._lock:
+                    with self._read_lock:
                         self._buffer += data
             except queue.Empty:
                 # Check if closed while waiting
-                if self._closed:
-                    with self._lock:
+                if self._write_closed:
+                    with self._read_lock:
                         if self._buffer:
                             data = self._buffer
                             self._buffer = b""
@@ -183,19 +194,26 @@ class QueueIO(io.RawIOBase):
                 # Continue waiting if not closed
 
     def close(self):
-        """Close the queue"""
+        """Close the queue for writing (standard producer-consumer pattern)
+        
+        This method closes the write side and sends EOF to readers.
+        For complete closure of both sides, use close_all().
+        """
+        self.close_write()
+        
+    def close_write(self):
+        """Close the queue for writing (producer side) only"""
         # First check if already closed without holding any locks
-        if self._closed:
+        if self._write_closed:
             return
-            
-        # Use a single lock to avoid deadlock issues
-        with self._lock:
-            if self._closed:
+
+        with self._write_lock:
+            if self._write_closed:
                 return  # Double-check after acquiring lock
-                
+
             # Mark as closed first to prevent new writes
-            self._closed = True
-            
+            self._write_closed = True
+
             # Flush any remaining data in write buffer
             if len(self._write_buffer) > 0:
                 try:
@@ -213,14 +231,14 @@ class QueueIO(io.RawIOBase):
                     pass
                 finally:
                     self._write_buffer = b""  # Clear the write buffer
-        
+
         # Put EOF marker - this is critical for proper shutdown
         # Use increasing timeouts to give readers time to consume data
         eof_delivered = False
         timeout = 0.1  # Start with 100ms
         max_timeout = 30.0  # Maximum total wait time
         total_waited = 0.0
-        
+
         while not eof_delivered and total_waited < max_timeout:
             try:
                 self._queue.put(None, block=True, timeout=timeout)
@@ -229,26 +247,56 @@ class QueueIO(io.RawIOBase):
                 # Queue is still full, increase timeout for next attempt
                 total_waited += timeout
                 timeout = min(timeout * 2, 1.0)  # Double timeout up to 1 second
-        
+
         if not eof_delivered:
             # Critical failure: EOF marker could not be delivered
             # This means readers may hang indefinitely
             # In a production system, this should trigger an alert
             pass
-            
-        super().close()
 
+    def close_read(self):
+        """Close the queue for reading (consumer side) only"""
+        with self._read_lock:
+            self._read_closed = True
+            self._buffer = b""  # Clear any remaining buffer
+            
+    def close_all(self):
+        """Close the queue completely (both reading and writing)
+        
+        Use this when QueueIO is used as a regular file-like object
+        that needs complete cleanup.
+        """
+        # First close writing side
+        self.close_write()
+        
+        # Then close reading side
+        with self._read_lock:
+            self._read_closed = True
+            self._buffer = b""  # Clear any remaining buffer
+            
+        # Mark as fully closed
+        self._fully_closed = True
+        
+        # Now we can close the underlying I/O object
+        super().close()
+            
     def seekable(self):
         """Indicate that this object is not seekable"""
         return False
 
     def readable(self):
         """Indicate that this object is readable"""
-        return True
+        return not self._read_closed
 
     def writable(self):
         """Indicate that this object is writable"""
-        return True
+        return not self._write_closed
+
+    @property
+    def closed(self):
+        """Check if the queue is closed for writing (backward compatibility)"""
+        # For backward compatibility, report closed if write side is closed
+        return self._write_closed
 
 
 class LimitedQueueIO(QueueIO):
@@ -328,7 +376,7 @@ class LimitedQueueIO(QueueIO):
         result = super().write(b)
         # update status bar after write
         if self.status_bar is not None:
-            with self._lock:
+            with self._write_lock:
                 self.status_bar.n = self._queue.qsize() * self._chunk_size + len(
                     self._write_buffer
                 )
@@ -350,7 +398,7 @@ class LimitedQueueIO(QueueIO):
         result = super().read(n)
         # update status bar
         if self.status_bar is not None:
-            with self._lock:
+            with self._read_lock:
                 self.status_bar.n = self._queue.qsize() * self._chunk_size + len(
                     self._buffer
                 )
@@ -359,6 +407,13 @@ class LimitedQueueIO(QueueIO):
 
     def close(self):
         """Close the queue and cleanup resources"""
-        super().close()
+        super().close()  # Call parent close for complete shutdown
         if hasattr(self, "status_bar") and self.status_bar is not None:
             self.status_bar.close()
+
+
+# Export names to maintain backward compatibility
+QueuePipeIO = QueueIO
+LimitedQueuePipeIO = LimitedQueueIO
+
+__all__ = ["QueueIO", "LimitedQueueIO", "QueuePipeIO", "LimitedQueuePipeIO"]

@@ -356,9 +356,7 @@ class S3StreamHandler:
 
         return queue_io
 
-    def _upload_worker(
-        self, queue_io: QueueIO, bucket: str, key: str, file_path: str
-    ):
+    def _upload_worker(self, queue_io: QueueIO, bucket: str, key: str, file_path: str):
         """Worker thread for upload streaming."""
         try:
             with open(file_path, "rb") as f:
