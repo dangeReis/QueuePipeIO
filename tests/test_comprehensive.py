@@ -643,9 +643,7 @@ class TestQueueIOIntegration(unittest.TestCase):
         self.assertTrue(write_failed, "Producer should have encountered full queue")
 
         # Should have written at least queue capacity
-        self.assertGreaterEqual(
-            write_count, 4, "Should write at least queue capacity"
-        )
+        self.assertGreaterEqual(write_count, 4, "Should write at least queue capacity")
         self.assertLess(
             write_count, 10, "Should write less than attempted due to backpressure"
         )

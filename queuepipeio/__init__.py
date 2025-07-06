@@ -83,9 +83,7 @@ class QueueIO(io.RawIOBase):
                     if self._write_timeout is None:
                         self._queue.put(chunk, block=True)
                     else:
-                        self._queue.put(
-                            chunk, block=True, timeout=self._write_timeout
-                        )
+                        self._queue.put(chunk, block=True, timeout=self._write_timeout)
                 except queue.Full:
                     # Re-add chunk to buffer and raise
                     self._write_buffer = chunk + self._write_buffer
