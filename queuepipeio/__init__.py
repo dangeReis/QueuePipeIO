@@ -1,17 +1,14 @@
-import boto3
 import io
 import queue
-import zstandard as zstd
 from time import sleep
-import threading
+
 from tqdm import tqdm
 
 progress_bar = None
-import io
-import queue
-from time import sleep
 
 MB = 1024 * 1024  # 1 MB
+
+
 class QueueIO(io.RawIOBase):
     """
     A class that represents a queue-based I/O object.
@@ -34,7 +31,7 @@ class QueueIO(io.RawIOBase):
         writable(): Indicate that this object is writable.
     """
 
-    def __init__(self, chunk_size=8*MB):
+    def __init__(self, chunk_size=8 * MB):
         """
         Initialize a QueueIO object.
 
@@ -43,8 +40,10 @@ class QueueIO(io.RawIOBase):
         """
         super().__init__()
         self._queue = queue.Queue()  # Queue to hold the data
-        self._buffer = b''  # Buffer to hold the data temporarily
-        self._write_buffer = b''  # Write buffer to hold the data before it's put into the queue
+        self._buffer = b""  # Buffer to hold the data temporarily
+        self._write_buffer = (
+            b""  # Write buffer to hold the data before it's put into the queue
+        )
         self._chunk_size = chunk_size  # Size of the chunks to put into the queue
 
     def write(self, b):
@@ -59,7 +58,10 @@ class QueueIO(io.RawIOBase):
         """
         self._write_buffer += b
         while len(self._write_buffer) >= self._chunk_size:
-            chunk, self._write_buffer = self._write_buffer[:self._chunk_size], self._write_buffer[self._chunk_size:]
+            chunk, self._write_buffer = (
+                self._write_buffer[: self._chunk_size],
+                self._write_buffer[self._chunk_size :],
+            )
             self._queue.put(chunk)
         return len(b)
 
@@ -68,7 +70,8 @@ class QueueIO(io.RawIOBase):
         Read data from the queue.
 
         Args:
-            n (int, optional): The number of bytes to read. Defaults to -1, which means read all available data.
+            n (int, optional): The number of bytes to read. Defaults to -1,
+                which means read all available data.
 
         Returns:
             bytes: The data read from the queue.
@@ -82,9 +85,9 @@ class QueueIO(io.RawIOBase):
                     self._buffer += data  # Add data to the buffer
             except queue.Empty:
                 if self.closed:
-                    if self._buffer != b'':
+                    if self._buffer != b"":
                         data = self._buffer
-                        self._buffer = b''
+                        self._buffer = b""
                         return data
                     else:
                         break
@@ -93,7 +96,7 @@ class QueueIO(io.RawIOBase):
 
         # Split the buffer into the data to return and the remaining buffer
         if n == -1:
-            data, self._buffer = self._buffer, b''
+            data, self._buffer = self._buffer, b""
         else:
             data, self._buffer = self._buffer[:n], self._buffer[n:]
 
@@ -103,7 +106,7 @@ class QueueIO(io.RawIOBase):
         """Close the queue"""
         if len(self._write_buffer) > 0:  # If there's remaining data in the write buffer
             self._queue.put(self._write_buffer)  # Put the remaining data into the queue
-            self._write_buffer = b''  # Clear the write buffer
+            self._write_buffer = b""  # Clear the write buffer
         self._queue.put(None)  # Put None in the queue to signal that it's closed
         super().close()
 
@@ -118,6 +121,8 @@ class QueueIO(io.RawIOBase):
     def writable(self):
         """Indicate that this object is writable"""
         return True
+
+
 class LimitedQueueIO(QueueIO):
     """
     A class that represents a limited queue-based input/output stream.
@@ -126,7 +131,8 @@ class LimitedQueueIO(QueueIO):
     by using a queue with a specified memory limit and chunk size.
 
     Args:
-        memory_limit (int, optional): The maximum memory limit in bytes. If not provided, there is no memory limit.
+        memory_limit (int, optional): The maximum memory limit in bytes.
+            If not provided, there is no memory limit.
         chunk_size (int, optional): The size of each chunk in bytes. Defaults to 8 * MB.
 
     Attributes:
@@ -140,22 +146,24 @@ class LimitedQueueIO(QueueIO):
 
     """
 
-    def __init__(self, memory_limit=None, chunk_size=8*MB):
-            """
-            Initialize the QueueBytesIO object.
+    def __init__(self, memory_limit=None, chunk_size=8 * MB):
+        """
+        Initialize the QueueBytesIO object.
 
-            Args:
-                memory_limit (int, optional): The maximum memory limit in bytes. Defaults to None.
-                chunk_size (int, optional): The size of each chunk in bytes. Defaults to 8*MB.
-            """
-            if memory_limit is not None:
-                queue_size = memory_limit // chunk_size
-            else:
-                return super().__init__(chunk_size)
-            super().__init__(chunk_size)
-            self._queue = queue.Queue(maxsize=queue_size)
-            self._buffer = b''
-            self.status_bar = tqdm(total=memory_limit, unit='B', unit_scale=True, unit_divisor=1024, position=1)
+        Args:
+            memory_limit (int, optional): The maximum memory limit in bytes. Defaults to None.
+            chunk_size (int, optional): The size of each chunk in bytes. Defaults to 8*MB.
+        """
+        if memory_limit is not None:
+            queue_size = memory_limit // chunk_size
+        else:
+            return super().__init__(chunk_size)
+        super().__init__(chunk_size)
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._buffer = b""
+        self.status_bar = tqdm(
+            total=memory_limit, unit="B", unit_scale=True, unit_divisor=1024, position=1
+        )
 
     def write(self, b):
         """
@@ -178,7 +186,8 @@ class LimitedQueueIO(QueueIO):
         Reads at most n bytes from the stream.
 
         Args:
-            n (int, optional): The maximum number of bytes to read. Defaults to -1, which means read all.
+            n (int, optional): The maximum number of bytes to read.
+                Defaults to -1, which means read all.
 
         Returns:
             bytes: The bytes read from the stream.
