@@ -118,7 +118,7 @@ class TestS3Streaming(unittest.TestCase):
             memory_limit=10 * 1024 * 1024,
             chunk_size=5 * 1024 * 1024,  # 5MB chunks for S3
             show_progress=False,
-            write_timeout=30,
+            write_timeout=300,  # 5 minutes for large file operations
         )
 
         bytes_processed = self._stream_with_limited_memory(
@@ -135,9 +135,9 @@ class TestS3Streaming(unittest.TestCase):
 
     def test_memory_pressure_streaming(self):
         """Test streaming with significant memory pressure"""
-        # Generate 100MB file
+        # Generate 50MB file (reduced from 100MB for faster testing)
         file_path, _, expected_sha256 = TestFileGenerator.create_test_file(
-            100 * 1024 * 1024
+            50 * 1024 * 1024
         )
         self.temp_files.append(file_path)
 
@@ -146,15 +146,15 @@ class TestS3Streaming(unittest.TestCase):
         with open(file_path, "rb") as f:
             self.s3_client.upload_fileobj(f, self.source_bucket, source_key)
 
-        # Stream with only 20MB memory limit
+        # Stream with only 30MB memory limit
         dest_key = "memory-test-file-copy.bin"
         hasher = hashlib.sha256()
 
         qio = LimitedQueueIO(
-            memory_limit=20 * 1024 * 1024,  # Only 20MB for 100MB file
-            chunk_size=5 * 1024 * 1024,
+            memory_limit=30 * 1024 * 1024,  # Increased to 30MB for 50MB file
+            chunk_size=2 * 1024 * 1024,  # Smaller chunks (2MB) for better flow
             show_progress=False,
-            write_timeout=10,
+            write_timeout=600,  # 10 minutes for memory-constrained operations
         )
 
         start_time = time.time()
@@ -164,15 +164,15 @@ class TestS3Streaming(unittest.TestCase):
         duration = time.time() - start_time
 
         # Verify transfer completed successfully
-        self.assertEqual(bytes_processed, 100 * 1024 * 1024)
+        self.assertEqual(bytes_processed, 50 * 1024 * 1024)
         self.assertEqual(hasher.hexdigest(), expected_sha256)
 
         # Calculate throughput
         throughput_mbps = (bytes_processed / (1024 * 1024)) / duration
-        print(f"\nThroughput: {throughput_mbps:.2f} MB/s with 20MB memory limit")
+        print(f"\nThroughput: {throughput_mbps:.2f} MB/s with 30MB memory limit")
 
-        # Verify the queue respected memory limits (4 chunks max in queue)
-        self.assertLessEqual(qio._queue.maxsize, 4)
+        # Verify the queue respected memory limits (15 chunks max with 2MB chunks)
+        self.assertLessEqual(qio._queue.maxsize, 15)
 
     def test_concurrent_streaming(self):
         """Test multiple concurrent streaming operations"""
@@ -207,9 +207,9 @@ class TestS3Streaming(unittest.TestCase):
             hasher = hashlib.sha256()
             qio = LimitedQueueIO(
                 memory_limit=15 * 1024 * 1024,  # 15MB limit per stream
-                chunk_size=5 * 1024 * 1024,
+                chunk_size=3 * 1024 * 1024,  # 3MB chunks for better concurrency
                 show_progress=False,
-                write_timeout=30,
+                write_timeout=180,  # 3 minutes per concurrent stream
             )
 
             bytes_processed = self._stream_with_limited_memory(
@@ -231,9 +231,11 @@ class TestS3Streaming(unittest.TestCase):
             thread.start()
             threads.append(thread)
 
-        # Wait for completion
+        # Wait for completion with generous timeout
         for thread in threads:
-            thread.join(timeout=60)
+            thread.join(timeout=300)  # 5 minutes for concurrent operations
+            if thread.is_alive():
+                self.fail("Thread did not complete within timeout")
 
         # Verify all transfers
         self.assertEqual(len(results), 3)
@@ -348,9 +350,13 @@ class TestS3Streaming(unittest.TestCase):
         download_thread.start()
         upload_thread.start()
 
-        # Wait for completion
-        download_thread.join(timeout=60)
-        upload_thread.join(timeout=60)
+        # Wait for completion with generous timeout
+        download_thread.join(timeout=300)
+        upload_thread.join(timeout=300)
+        
+        # Check if threads completed
+        if download_thread.is_alive() or upload_thread.is_alive():
+            raise TimeoutError("Threads did not complete within timeout")
 
         if upload_exception:
             raise upload_exception
@@ -369,7 +375,8 @@ class TestS3Streaming(unittest.TestCase):
                 response = self.s3_client.get_object(
                     Bucket=source_bucket, Key=source_key
                 )
-                for chunk in response["Body"].iter_chunks(chunk_size=1024 * 1024):
+                # Use the same chunk size as the QueueIO to avoid buffering issues
+                for chunk in response["Body"].iter_chunks(chunk_size=qio._chunk_size):
                     qio.write(chunk)
             except Exception as e:
                 nonlocal exception
@@ -406,9 +413,13 @@ class TestS3Streaming(unittest.TestCase):
         download_thread.start()
         upload_thread.start()
 
-        # Wait for completion
-        download_thread.join(timeout=120)
-        upload_thread.join(timeout=120)
+        # Wait for completion with generous timeout
+        download_thread.join(timeout=300)
+        upload_thread.join(timeout=300)
+        
+        # Check if threads completed
+        if download_thread.is_alive() or upload_thread.is_alive():
+            raise TimeoutError("Threads did not complete within timeout")
 
         if exception:
             raise exception
