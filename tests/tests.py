@@ -29,7 +29,7 @@ class TestQueueIO(unittest.TestCase):
 class TestLimitedQueueIO(unittest.TestCase):
     def setUp(self):
         self.lqio = LimitedQueueIO(
-            memory_limit=16 * MB, chunk_size=8 * MB
+            memory_limit=16 * MB, chunk_size=8 * MB, show_progress=False
         )  # Updated class name
 
     def test_write(self):
