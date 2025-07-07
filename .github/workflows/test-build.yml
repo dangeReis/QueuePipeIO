@@ -31,7 +31,13 @@ jobs:
     - name: Build a binary wheel and a source tarball
       run: python -m build --sdist --wheel --outdir dist/
     - name: Check distribution
-      run: twine check dist/*
+      run: |
+        pip install twine
+        twine check dist/*
+        echo "Contents of dist directory:"
+        ls -la dist/
+        echo -e "\nChecking wheel metadata:"
+        python -c "import zipfile, glob; whl = glob.glob('dist/*.whl')[0]; z = zipfile.ZipFile(whl); print(z.read([f for f in z.namelist() if f.endswith('METADATA')][0]).decode()[:500])"
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
