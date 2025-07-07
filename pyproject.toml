@@ -1,2 +1,55 @@
 [build-system]
-requires = ["setuptools", "wheel", "pypandoc"]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "queuepipeio"
+version = "0.1.12"
+description = "A pipe-based I/O library for efficient data transfer between threads with filtering support"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},  # TODO: Update
+]
+maintainers = [
+    {name = "Your Name", email = "your.email@example.com"},  # TODO: Update
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "boto3",
+    "black",
+    "flake8",
+    "bump2version",
+    "build",
+    "twine",
+]
+test = [
+    "boto3",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/queuepipeio"  # TODO: Update
+Repository = "https://github.com/yourusername/queuepipeio"  # TODO: Update
+Issues = "https://github.com/yourusername/queuepipeio/issues"  # TODO: Update
+
+[tool.setuptools]
+packages = ["queuepipeio"]
+
+[tool.setuptools.package-data]
+queuepipeio = ["py.typed"]
