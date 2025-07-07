@@ -1,326 +1,59 @@
+"""
+QueuePipeIO - A pipe-based I/O library for Python
+
+This module provides a pipe-based I/O system that allows for unidirectional
+data flow between components, similar to Unix pipes.
+
+Example usage:
+    writer = PipeWriter()
+    reader = PipeReader()
+    writer.connect(reader)
+
+    # Write in one thread
+    writer.write(b"Hello, World!")
+    writer.close()
+
+    # Read in another thread
+    data = reader.read()
+"""
+
 import io
 import queue
 import threading
-import time
+import hashlib
+from abc import ABC, abstractmethod
 
 from tqdm import tqdm
-
-progress_bar = None
 
 MB = 1024 * 1024  # 1 MB
 
 
-class QueueIO(io.RawIOBase):
-    """
-    A class that represents a queue-based I/O object.
+class PipeBase(ABC):
+    """Abstract base class for pipe components."""
 
-    This class provides a queue-based I/O functionality, where data can be written to the queue
-    and read from the queue. The data is stored in chunks of a specified size.
-
-    Attributes:
-        _queue (queue.Queue): The queue to hold the data.
-        _buffer (bytes): The buffer to hold the data temporarily.
-        _write_buffer (bytes): The write buffer to hold the data before it's put into the queue.
-        _chunk_size (int): The size of the chunks to put into the queue.
-        _write_timeout (float): Timeout in seconds for write operations.
-
-    Methods:
-        write(b): Write data to the queue.
-        read(n=-1): Read data from the queue.
-        close(): Close the queue.
-        seekable(): Indicate that this object is not seekable.
-        readable(): Indicate that this object is readable.
-        writable(): Indicate that this object is writable.
-    """
-
-    def __init__(self, chunk_size=8 * MB, write_timeout=None):
-        """
-        Initialize a QueueIO object.
-
-        Args:
-            chunk_size (int): Size of the chunks to put into the queue. Default is 8*MB.
-            write_timeout (float, optional): Timeout in seconds for write operations.
-                                           None means block forever (default).
-        """
-        super().__init__()
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
-        self._queue = queue.Queue()  # Queue to hold the data
-        self._buffer = b""  # Buffer to hold the data temporarily
-        self._write_buffer = (
-            b""  # Write buffer to hold the data before it's put into the queue
-        )
-        self._chunk_size = chunk_size  # Size of the chunks to put into the queue
-        self._write_timeout = write_timeout  # Timeout for write operations
-        self._read_lock = threading.Lock()  # Lock for read buffer operations
-        self._write_lock = threading.Lock()  # Lock for write buffer operations
-        self._write_closed = False  # Track if writing is closed
-        self._read_closed = False  # Track if reading is closed
-        self._fully_closed = False  # Track if both sides are closed
-
-    def write(self, b):
-        """
-        Write data to the queue.
-
-        Args:
-            b (bytes): The data to be written.
-
-        Returns:
-            int: The number of bytes written.
-        """
-        if not isinstance(b, (bytes, bytearray)):
-            raise TypeError(
-                f"a bytes-like object is required, not '{type(b).__name__}'"
-            )
-
-        with self._write_lock:
-            # Check closed state while holding the lock to prevent race condition
-            if self._write_closed:
-                raise ValueError("I/O operation on closed file")
-
-            self._write_buffer += b
-            while len(self._write_buffer) >= self._chunk_size:
-                chunk, self._write_buffer = (
-                    self._write_buffer[: self._chunk_size],
-                    self._write_buffer[self._chunk_size :],
-                )
-
-                # Retry logic with exponential backoff for queue.Full
-                if self._write_timeout is None:
-                    # No timeout specified, just put normally
-                    self._queue.put(chunk, block=True)
-                else:
-                    # With timeout, use retry mechanism
-                    retry_count = 0
-                    max_retries = 3  # Reduced number of retries
-                    base_timeout = 0.01  # Shorter base timeout
-                    total_elapsed = 0.0
-
-                    while total_elapsed < self._write_timeout:
-                        try:
-                            # Calculate remaining timeout
-                            remaining_timeout = self._write_timeout - total_elapsed
-                            if remaining_timeout <= 0:
-                                break
-
-                            # Use exponential backoff, but cap at remaining timeout
-                            timeout = min(
-                                remaining_timeout, base_timeout * (2**retry_count)
-                            )
-                            start_time = time.time()
-
-                            self._queue.put(chunk, block=True, timeout=timeout)
-                            break  # Success, exit retry loop
-                        except queue.Full:
-                            elapsed = time.time() - start_time
-                            total_elapsed += elapsed
-
-                            if self._write_closed:
-                                # If we're closed, don't keep retrying
-                                self._write_buffer = chunk + self._write_buffer
-                                raise ValueError("I/O operation on closed file")
-
-                            retry_count += 1
-                            if (
-                                retry_count >= max_retries
-                                or total_elapsed >= self._write_timeout
-                            ):
-                                # No more retries, re-add chunk and raise
-                                self._write_buffer = chunk + self._write_buffer
-                                raise
-
-                            # Continue retrying
-                            continue
-        return len(b)
-
-    def read(self, n=-1):
-        """
-        Read data from the queue.
-
-        Args:
-            n (int, optional): The number of bytes to read. Defaults to -1,
-                which means read all available data.
-
-        Returns:
-            bytes: The data read from the queue.
-        """
-        if n == 0:
-            return b""
-
-        if self._read_closed:
-            raise ValueError("I/O operation on closed file")
-
-        with self._read_lock:
-            # If we have enough data in buffer, return it immediately
-            if n != -1 and len(self._buffer) >= n:
-                data, self._buffer = self._buffer[:n], self._buffer[n:]
-                return data
-
-        while True:
-            with self._read_lock:
-                # Check if we have enough data now
-                if n != -1 and len(self._buffer) >= n:
-                    data, self._buffer = self._buffer[:n], self._buffer[n:]
-                    return data
-
-                # Check if we should return what we have
-                if self._write_closed and self._queue.empty():
-                    data = self._buffer
-                    self._buffer = b""
-                    return data
-
-            try:
-                # Use timeout instead of polling with sleep
-                data = self._queue.get(timeout=0.1)
-                if data is None:  # EOF marker
-                    with self._read_lock:
-                        result = self._buffer
-                        self._buffer = b""
-                        self._write_closed = True  # Writer has closed
-                    return result
-                else:
-                    with self._read_lock:
-                        self._buffer += data
-            except queue.Empty:
-                # Check if closed while waiting
-                if self._write_closed:
-                    with self._read_lock:
-                        if self._buffer:
-                            data = self._buffer
-                            self._buffer = b""
-                            return data
-                        else:
-                            return b""
-                # Continue waiting if not closed
-
+    @abstractmethod
     def close(self):
-        """Close the queue for writing (standard producer-consumer pattern)
+        """Close the pipe component."""
+        pass
 
-        This method closes the write side and sends EOF to readers.
-        For complete closure of both sides, use close_all().
-        """
-        self.close_write()
-
-    def close_write(self):
-        """Close the queue for writing (producer side) only"""
-        # First check if already closed without holding any locks
-        if self._write_closed:
-            return
-
-        with self._write_lock:
-            if self._write_closed:
-                return  # Double-check after acquiring lock
-
-            # Mark as closed first to prevent new writes
-            self._write_closed = True
-
-            # Flush any remaining data in write buffer
-            if len(self._write_buffer) > 0:
-                try:
-                    if self._write_timeout is None:
-                        self._queue.put(self._write_buffer, block=True)
-                    else:
-                        self._queue.put(
-                            self._write_buffer,
-                            block=True,
-                            timeout=self._write_timeout,
-                        )
-                except queue.Full:
-                    # If queue is full, we need to ensure EOF is still delivered
-                    # Clear the write buffer as data will be lost
-                    pass
-                finally:
-                    self._write_buffer = b""  # Clear the write buffer
-
-        # Put EOF marker - this is critical for proper shutdown
-        # Use increasing timeouts to give readers time to consume data
-        eof_delivered = False
-        timeout = 0.1  # Start with 100ms
-        max_timeout = 30.0  # Maximum total wait time
-        total_waited = 0.0
-
-        while not eof_delivered and total_waited < max_timeout:
-            try:
-                self._queue.put(None, block=True, timeout=timeout)
-                eof_delivered = True
-            except queue.Full:
-                # Queue is still full, increase timeout for next attempt
-                total_waited += timeout
-                timeout = min(timeout * 2, 1.0)  # Double timeout up to 1 second
-
-        if not eof_delivered:
-            # Critical failure: EOF marker could not be delivered
-            # This means readers may hang indefinitely
-            # In a production system, this should trigger an alert
-            pass
-
-    def close_read(self):
-        """Close the queue for reading (consumer side) only"""
-        with self._read_lock:
-            self._read_closed = True
-            self._buffer = b""  # Clear any remaining buffer
-
-    def close_all(self):
-        """Close the queue completely (both reading and writing)
-
-        Use this when QueueIO is used as a regular file-like object
-        that needs complete cleanup.
-        """
-        # First close writing side
-        self.close_write()
-
-        # Then close reading side
-        with self._read_lock:
-            self._read_closed = True
-            self._buffer = b""  # Clear any remaining buffer
-
-        # Mark as fully closed
-        self._fully_closed = True
-
-        # Now we can close the underlying I/O object
-        super().close()
-
-    def seekable(self):
-        """Indicate that this object is not seekable"""
-        return False
-
-    def readable(self):
-        """Indicate that this object is readable"""
-        return not self._read_closed
-
-    def writable(self):
-        """Indicate that this object is writable"""
-        return not self._write_closed
-
-    @property
-    def closed(self):
-        """Check if the queue is closed for writing (backward compatibility)"""
-        # For backward compatibility, report closed if write side is closed
-        return self._write_closed
+    @abstractmethod
+    def __or__(self, other):
+        """Allow pipe chaining with | operator."""
+        pass
 
 
-class LimitedQueueIO(QueueIO):
+class PipeWriter(PipeBase, io.RawIOBase):
     """
-    A class that represents a limited queue-based input/output stream.
+    Write-only endpoint of a pipe.
 
-    This class inherits from the `QueueIO` class and adds functionality to limit the memory usage
-    by using a queue with a specified memory limit and chunk size.
+    This class provides a write-only interface to put data into a queue
+    that can be read by a connected PipeReader.
 
     Args:
-        memory_limit (int, optional): The maximum memory limit in bytes.
-            If not provided, there is no memory limit.
-        chunk_size (int, optional): The size of each chunk in bytes. Defaults to 8 * MB.
-        show_progress (bool, optional): Whether to show a progress bar. Defaults to False.
-
-    Attributes:
-        _queue (Queue): The queue used to store the chunks of data.
-        _buffer (bytes): The buffer used to store the remaining data.
-        status_bar (tqdm.tqdm): The progress bar used to track the memory usage (if enabled).
-
-    Methods:
-        write(b): Writes the given bytes to the stream.
-        read(n=-1): Reads at most n bytes from the stream.
-
+        memory_limit (int, optional): Maximum memory limit in bytes.
+        chunk_size (int): Size of data chunks (default 8MB).
+        show_progress (bool): Whether to show progress bar.
+        write_timeout (float, optional): Timeout for write operations.
     """
 
     def __init__(
@@ -330,177 +63,426 @@ class LimitedQueueIO(QueueIO):
         show_progress=False,
         write_timeout=None,
     ):
-        """
-        Initialize the QueueBytesIO object.
+        super().__init__()
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
 
-        Args:
-            memory_limit (int, optional): The maximum memory limit in bytes. Defaults to None.
-            chunk_size (int, optional): The size of each chunk in bytes. Defaults to 8*MB.
-            show_progress (bool, optional): Whether to show a progress bar. Defaults to False.
-            write_timeout (float, optional): Timeout in seconds for write operations
-                when queue is full. None means block forever (default).
-        """
-        # Initialize parent with write_timeout
-        super().__init__(chunk_size, write_timeout)
+        self._chunk_size = chunk_size
+        self._write_timeout = write_timeout
+        self._write_buffer = b""
+        self._closed = False
+        self._queue = None
+        self._connected_reader = None
+        self._memory_limit = memory_limit
         self.show_progress = show_progress
+        self.progress_bar = None
 
-        if memory_limit is not None:
-            if memory_limit <= 0:
-                raise ValueError("memory_limit must be positive")
-            queue_size = max(1, memory_limit // chunk_size)
-            self._queue = queue.Queue(maxsize=queue_size)
-            if self.show_progress:
-                self.status_bar = tqdm(
-                    total=memory_limit,
+        # Validate memory limit
+        if memory_limit is not None and memory_limit <= 0:
+            raise ValueError("memory_limit must be positive")
+
+    def connect(self, reader: "PipeReader"):
+        """Connect this writer to a reader."""
+        if self._connected_reader is not None:
+            raise RuntimeError("Writer already connected to a reader")
+        if not isinstance(reader, PipeReader):
+            raise TypeError("Can only connect to PipeReader")
+
+        # Create queue on first connection
+        if self._queue is None:
+            if self._memory_limit is not None:
+                queue_size = max(1, self._memory_limit // self._chunk_size)
+                self._queue = queue.Queue(maxsize=queue_size)
+            else:
+                self._queue = queue.Queue()
+
+            # Create progress bar if needed
+            if self.show_progress and self._memory_limit:
+                self.progress_bar = tqdm(
+                    total=self._memory_limit,
                     unit="B",
                     unit_scale=True,
                     unit_divisor=1024,
                     position=1,
                 )
+
+        self._connected_reader = reader
+        reader._set_queue(self._queue)
+
+    def write(self, b: bytes) -> int:
+        """Write data to the pipe."""
+        if not isinstance(b, (bytes, bytearray)):
+            raise TypeError(
+                f"a bytes-like object is required, not '{type(b).__name__}'"
+            )
+
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
+
+        if self._queue is None:
+            raise RuntimeError("Writer not connected to any reader")
+
+        self._write_buffer += b
+
+        # Chunk and send data
+        while len(self._write_buffer) >= self._chunk_size:
+            chunk = self._write_buffer[: self._chunk_size]
+            self._write_buffer = self._write_buffer[self._chunk_size :]
+
+            if self._write_timeout is None:
+                self._queue.put(chunk, block=True)
             else:
-                self.status_bar = None
-        else:
-            self.status_bar = None
+                self._queue.put(chunk, block=True, timeout=self._write_timeout)
 
-    def write(self, b):
-        """
-        Writes the given bytes to the stream.
+        # Update progress bar
+        if self.progress_bar:
+            queue_bytes = self._queue.qsize() * self._chunk_size
+            buffer_bytes = len(self._write_buffer)
+            self.progress_bar.n = queue_bytes + buffer_bytes
+            self.progress_bar.refresh()
 
-        Args:
-            b (bytes): The bytes to be written.
-
-        Returns:
-            int: The number of bytes written.
-
-        """
-        result = super().write(b)
-        # update status bar after write
-        if self.status_bar is not None:
-            with self._write_lock:
-                self.status_bar.n = self._queue.qsize() * self._chunk_size + len(
-                    self._write_buffer
-                )
-                self.status_bar.refresh()
-        return result
-
-    def read(self, n=-1):
-        """
-        Reads at most n bytes from the stream.
-
-        Args:
-            n (int, optional): The maximum number of bytes to read.
-                Defaults to -1, which means read all.
-
-        Returns:
-            bytes: The bytes read from the stream.
-
-        """
-        result = super().read(n)
-        # update status bar
-        if self.status_bar is not None:
-            with self._read_lock:
-                self.status_bar.n = self._queue.qsize() * self._chunk_size + len(
-                    self._buffer
-                )
-                self.status_bar.refresh()
-        return result
+        return len(b)
 
     def close(self):
-        """Close the queue and cleanup resources"""
-        super().close()  # Call parent close for complete shutdown
-        if hasattr(self, "status_bar") and self.status_bar is not None:
-            self.status_bar.close()
+        """Close the writer and send EOF marker."""
+        if self._closed:
+            return
+
+        self._closed = True
+
+        # Flush remaining buffer
+        if self._write_buffer and self._queue is not None:
+            if self._write_timeout is None:
+                self._queue.put(self._write_buffer, block=True)
+            else:
+                self._queue.put(
+                    self._write_buffer, block=True, timeout=self._write_timeout
+                )
+            self._write_buffer = b""
+
+        # Send EOF marker
+        if self._queue is not None:
+            self._queue.put(None, block=True)
+
+        # Close progress bar
+        if self.progress_bar:
+            self.progress_bar.close()
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return not self._closed
+
+    def seekable(self):
+        return False
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def __or__(self, other):
+        """Pipe operator for chaining."""
+        if isinstance(other, PipeReader):
+            self.connect(other)
+            return other
+        elif isinstance(other, PipeFilter):
+            self.connect(other.input)
+            other.start()
+            return other
+        else:
+            raise TypeError(f"Cannot pipe to {type(other)}")
 
 
-class HashingLimitedQueueIO(LimitedQueueIO):
+class PipeReader(PipeBase, io.RawIOBase):
     """
-    A LimitedQueueIO that computes hash of data as it's read.
+    Read-only endpoint of a pipe.
 
-    This class computes the hash on the consumer side (during read operations),
-    which is useful when:
-    - Different consumers need different hash algorithms
-    - The producer shouldn't know about hashing requirements
-    - You want to verify data integrity on the consumer side
-
-    Args:
-        hash_algorithm (str): Hash algorithm to use (default: 'sha256')
-        memory_limit (int, optional): Maximum memory limit in bytes
-        chunk_size (int, optional): Size of each chunk in bytes
-        show_progress (bool, optional): Whether to show a progress bar
-        write_timeout (float, optional): Timeout for write operations
+    This class provides a read-only interface to get data from a queue
+    that was written by a connected PipeWriter.
     """
 
-    def __init__(self, hash_algorithm="sha256", **kwargs):
-        """Initialize with hash algorithm and standard LimitedQueueIO parameters."""
-        super().__init__(**kwargs)
+    def __init__(self):
+        super().__init__()
+        self._queue = None
+        self._buffer = b""
+        self._closed = False
+        self._eof = False
 
-        import hashlib
+    def _set_queue(self, queue_obj):
+        """Set the queue to read from (called by PipeWriter.connect)."""
+        if self._queue is not None:
+            raise RuntimeError("Reader already connected to a queue")
+        self._queue = queue_obj
 
-        self._hasher = hashlib.new(hash_algorithm)
-        self._hash_lock = threading.Lock()
-        self._bytes_hashed = 0
-        self._hash_algorithm = hash_algorithm
+    def read(self, n=-1) -> bytes:
+        """Read data from the pipe."""
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
 
-    def read(self, n=-1):
-        """
-        Read data from the queue and update hash.
+        if self._queue is None:
+            raise RuntimeError("Reader not connected to any writer")
 
-        Args:
-            n (int, optional): Number of bytes to read. -1 means read all.
+        if n == 0:
+            return b""
 
-        Returns:
-            bytes: The data read from the queue.
-        """
-        # Get data from parent
-        data = super().read(n)
+        # If we have enough buffered data, return it
+        if n > 0 and len(self._buffer) >= n:
+            data = self._buffer[:n]
+            self._buffer = self._buffer[n:]
+            return data
 
-        # Update hash with the data we're returning
-        if data:
-            with self._hash_lock:
-                self._hasher.update(data)
-                self._bytes_hashed += len(data)
+        # Read more data from queue
+        while True:
+            # Check if we have enough data now
+            if n > 0 and len(self._buffer) >= n:
+                data = self._buffer[:n]
+                self._buffer = self._buffer[n:]
+                return data
 
+            # If EOF and no more data, return what we have
+            if self._eof:
+                data = self._buffer
+                self._buffer = b""
+                return data
+
+            try:
+                chunk = self._queue.get(timeout=0.1)
+                if chunk is None:
+                    # EOF marker
+                    self._eof = True
+                    if n < 0:
+                        # Return all buffered data
+                        data = self._buffer
+                        self._buffer = b""
+                        return data
+                else:
+                    self._buffer += chunk
+
+            except queue.Empty:
+                # If we have some data and n is specified, return what we have
+                if n > 0 and self._buffer:
+                    data = self._buffer[:n]
+                    self._buffer = self._buffer[n:]
+                    return data
+                # Otherwise continue waiting
+
+    def close(self):
+        """Close the reader."""
+        self._closed = True
+        self._buffer = b""
+
+    def readable(self):
+        return not self._closed
+
+    def writable(self):
+        return False
+
+    def seekable(self):
+        return False
+
+    @property
+    def closed(self):
+        return self._closed
+
+    def __or__(self, other):
+        """Pipe operator for chaining."""
+        if isinstance(other, PipeWriter):
+            # Create a filter that copies data
+            copy_filter = CopyFilter()
+            copy_filter.input._set_queue(self._queue)
+            copy_filter.output = other
+            copy_filter.start()
+            return other
+        elif isinstance(other, PipeFilter):
+            other.input._set_queue(self._queue)
+            other.start()
+            return other
+        else:
+            raise TypeError(f"Cannot pipe to {type(other)}")
+
+
+class PipeFilter(PipeBase):
+    """
+    Abstract base class for pipe filters.
+
+    A filter reads from one pipe, processes the data, and writes to another.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.input = PipeReader()
+        self.output = None
+        self._thread = None
+        self._closed = False
+
+    @abstractmethod
+    def process(self, data: bytes) -> bytes:
+        """Process a chunk of data."""
+        pass
+
+    def start(self):
+        """Start the filter processing thread."""
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run)
+            self._thread.daemon = True
+            self._thread.start()
+
+    def _run(self):
+        """Run the filter processing loop."""
+        try:
+            while not self._closed:
+                chunk = self.input.read(self._chunk_size)
+                if not chunk:
+                    break
+
+                processed = self.process(chunk)
+                if processed and self.output:
+                    self.output.write(processed)
+
+        finally:
+            if self.output:
+                self.output.close()
+
+    def close(self):
+        """Close the filter."""
+        self._closed = True
+        if self._thread:
+            self._thread.join()
+        self.input.close()
+        if self.output:
+            self.output.close()
+
+    def __or__(self, other):
+        """Pipe operator for chaining."""
+        if isinstance(other, PipeReader):
+            # Connect our output writer to the reader
+            if self.output is None:
+                self.output = PipeWriter()
+            self.output.connect(other)
+            return other
+        elif isinstance(other, PipeWriter):
+            # Connect directly
+            self.output = other
+            return other
+        elif isinstance(other, PipeFilter):
+            # Chain filters
+            if self.output is None:
+                self.output = PipeWriter()
+            self.output.connect(other.input)
+            other.start()
+            return other
+        else:
+            raise TypeError(f"Cannot pipe to {type(other)}")
+
+
+class CopyFilter(PipeFilter):
+    """Simple filter that copies data without modification."""
+
+    def __init__(self, chunk_size=8 * MB):
+        super().__init__()
+        self._chunk_size = chunk_size
+
+    def process(self, data: bytes) -> bytes:
         return data
 
-    def get_hash(self):
-        """
-        Get the computed hash as hexdigest.
 
-        Returns:
-            str: Hexadecimal digest of the hash.
-        """
+class HashingFilter(PipeFilter):
+    """
+    Filter that computes hash of data passing through.
+
+    Args:
+        algorithm (str): Hash algorithm to use (default: 'sha256')
+        chunk_size (int): Size of data chunks
+    """
+
+    def __init__(self, algorithm="sha256", chunk_size=8 * MB):
+        super().__init__()
+        self._chunk_size = chunk_size
+        self._algorithm = algorithm
+        self._hasher = hashlib.new(algorithm)
+        self._hash_lock = threading.Lock()
+        self._bytes_hashed = 0
+
+    def process(self, data: bytes) -> bytes:
+        """Update hash and pass data through."""
+        with self._hash_lock:
+            self._hasher.update(data)
+            self._bytes_hashed += len(data)
+        return data
+
+    def get_hash(self) -> str:
+        """Get the computed hash as hexdigest."""
         with self._hash_lock:
             return self._hasher.hexdigest()
 
-    def get_bytes_hashed(self):
-        """
-        Get the number of bytes that have been hashed.
-
-        Returns:
-            int: Number of bytes hashed so far.
-        """
+    def get_bytes_hashed(self) -> int:
+        """Get the number of bytes hashed."""
         with self._hash_lock:
             return self._bytes_hashed
 
     def reset_hash(self):
-        """Reset the hash computation to start fresh."""
-        import hashlib
-
+        """Reset the hash computation."""
         with self._hash_lock:
-            self._hasher = hashlib.new(self._hash_algorithm)
+            self._hasher = hashlib.new(self._algorithm)
             self._bytes_hashed = 0
 
 
-# Export names to maintain backward compatibility
-QueuePipeIO = QueueIO
-LimitedQueuePipeIO = LimitedQueueIO
-HashingQueuePipeIO = HashingLimitedQueueIO  # Alias for consistency
+# Convenience class that combines writer and reader for backward compatibility
+class QueuePipeIO:
+    """
+    Backward compatibility wrapper that provides both read and write.
 
+    Note: This is provided for compatibility but the new architecture
+    encourages using separate PipeWriter and PipeReader instances.
+    """
+
+    def __init__(self, memory_limit=None, chunk_size=8 * MB, show_progress=False):
+        self.writer = PipeWriter(memory_limit, chunk_size, show_progress)
+        self.reader = PipeReader()
+        self.writer.connect(self.reader)
+
+    def write(self, b):
+        return self.writer.write(b)
+
+    def read(self, n=-1):
+        return self.reader.read(n)
+
+    def close(self):
+        self.writer.close()
+
+    def close_all(self):
+        self.writer.close()
+        self.reader.close()
+
+    @property
+    def closed(self):
+        return self.writer.closed
+
+    def readable(self):
+        return self.reader.readable()
+
+    def writable(self):
+        return self.writer.writable()
+
+    def seekable(self):
+        return False
+
+
+# Aliases for backward compatibility
+QueueIO = QueuePipeIO
+LimitedQueueIO = QueuePipeIO
+LimitedQueuePipeIO = QueuePipeIO
+
+# New-style exports
 __all__ = [
+    "PipeWriter",
+    "PipeReader",
+    "PipeFilter",
+    "HashingFilter",
+    "CopyFilter",
+    "QueuePipeIO",
     "QueueIO",
     "LimitedQueueIO",
-    "QueuePipeIO",
     "LimitedQueuePipeIO",
-    "HashingLimitedQueueIO",
-    "HashingQueuePipeIO",
 ]
