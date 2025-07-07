@@ -36,8 +36,8 @@ jobs:
         twine check dist/*
         echo "Contents of dist directory:"
         ls -la dist/
-        echo "\nChecking wheel metadata:"
-        python -c "import zipfile; z = zipfile.ZipFile('dist/'+(import glob, glob.glob('dist/*.whl')[0])[1]); print(z.read(next(f for f in z.namelist() if f.endswith('METADATA'))).decode()[:500])"
+        echo -e "\nChecking wheel metadata:"
+        python -c "import zipfile, glob; whl = glob.glob('dist/*.whl')[0]; z = zipfile.ZipFile(whl); print(z.read([f for f in z.namelist() if f.endswith('METADATA')][0]).decode()[:500])"
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
