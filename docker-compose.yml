@@ -1,0 +1,22 @@
+
+services:
+  localstack:
+    image: localstack/localstack:latest
+    container_name: queuepipeio-localstack
+    ports:
+      - "4566:4566"  # LocalStack gateway
+      - "4571:4571"  # Legacy S3 port (for compatibility)
+    environment:
+      - SERVICES=s3
+      - DEBUG=0
+      - DATA_DIR=/tmp/localstack/data
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AWS_DEFAULT_REGION=us-east-1
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./tests/localstack_init:/docker-entrypoint-initaws.d"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
