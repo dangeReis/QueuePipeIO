@@ -1,4 +1,9 @@
-"""S3 test utilities for QueueIO with LocalStack support."""
+"""S3 test utilities for QueueIO with LocalStack support.
+
+DEPRECATED: This file uses the old QueueIO API. 
+For new tests, use the pipe architecture with PipeWriter/PipeReader.
+See test_s3_integration.py for examples.
+"""
 
 import os
 import hashlib
@@ -17,7 +22,7 @@ except ImportError:
     ClientError = None
     BOTO3_AVAILABLE = False
 
-from queuepipeio import QueueIO, LimitedQueueIO
+from queuepipeio import PipeWriter, PipeReader, HashingFilter
 
 
 class S3TestConfig:

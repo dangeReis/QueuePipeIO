@@ -1,0 +1,59 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Start LocalStack",
+            "type": "shell",
+            "command": "make localstack-start",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "group": {
+                "kind": "test",
+                "isDefault": false
+            }
+        },
+        {
+            "label": "Stop LocalStack",
+            "type": "shell",
+            "command": "make localstack-stop",
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "Run S3 Tests",
+            "type": "shell",
+            "command": "make test-s3",
+            "dependsOn": ["Start LocalStack"],
+            "problemMatcher": ["$python"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "group": {
+                "kind": "test",
+                "isDefault": false
+            }
+        },
+        {
+            "label": "Run All Tests (with S3)",
+            "type": "shell", 
+            "command": "python -m unittest discover -s tests -v",
+            "dependsOn": ["Start LocalStack"],
+            "problemMatcher": ["$python"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            }
+        }
+    ]
+}

@@ -5,7 +5,7 @@ long_description = pypandoc.convert_file("README.md", "rst")
 setup(
     name="queuepipeio",  # Updated package name
     version="0.1.12",
-    description="A project that provides queue-based I/O functionality",
+    description="A pipe-based I/O library for efficient data transfer between threads with filtering support",
     packages=find_packages(),
     install_requires=["tqdm"],
     classifiers=[

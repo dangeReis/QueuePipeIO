@@ -1,519 +1,654 @@
 #!/usr/bin/env python3
 """
-S3 Integration Tests for QueueIO using LocalStack
+S3 integration tests using LocalStack for the new pipe architecture.
 
-This module tests streaming files between S3 buckets while computing hashes
-and respecting memory limits.
+These tests verify that QueuePipeIO works correctly with S3 operations
+including uploads, downloads, and hash verification.
+
+LocalStack is automatically started/stopped for these tests.
 """
 
 import unittest
-import os
-import sys
-import time
 import threading
 import hashlib
-import tempfile
-from io import BytesIO
+import time
+import os
+import sys
+import subprocess
+import atexit
+from unittest import skipUnless
 
-# Add parent directory to path for queuepipeio import
+# Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from queuepipeio import QueueIO, LimitedQueueIO
+from queuepipeio import PipeWriter, PipeReader, HashingFilter
 
+# Try to import boto3
 try:
-    # Try relative import first (when run as package)
-    from .s3_test_utils import (
-        S3StreamHandler,
-        TestFileGenerator,
-        create_test_environment,
-    )
+    import boto3
+    from botocore.exceptions import ClientError
+    BOTO3_AVAILABLE = True
 except ImportError:
-    # Fall back to absolute import (when run directly or by VSCode)
-    from s3_test_utils import (
-        S3StreamHandler,
-        TestFileGenerator,
-        create_test_environment,
+    boto3 = None
+    ClientError = None
+    BOTO3_AVAILABLE = False
+
+MB = 1024 * 1024
+
+
+class LocalStackManager:
+    """Manages LocalStack lifecycle for tests."""
+    _instance = None
+    _started = False
+    _process = None
+    
+    # Environment variable to keep LocalStack running
+    KEEP_RUNNING = os.environ.get('KEEP_LOCALSTACK', '').lower() in ('1', 'true', 'yes')
+    
+    @classmethod
+    def start(cls):
+        """Start LocalStack if not already running."""
+        if cls._started or cls.is_running():
+            return True
+        
+        print("\n🚀 Starting LocalStack for S3 tests...")
+        try:
+            # Start LocalStack using docker-compose
+            result = subprocess.run(
+                ["docker-compose", "up", "-d", "localstack"],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode != 0:
+                print(f"Error: {result.stderr}")
+                return False
+            
+            # Wait for LocalStack to be ready
+            max_retries = 30
+            for i in range(max_retries):
+                time.sleep(1)
+                if cls.is_running():
+                    cls._started = True
+                    print("✅ LocalStack started successfully")
+                    
+                    # Ensure test bucket exists
+                    cls._create_test_bucket()
+                    return True
+                
+                if i % 5 == 0:
+                    print(f"   Waiting for LocalStack to start... ({i}/{max_retries})")
+            
+            print("❌ LocalStack failed to start")
+            return False
+            
+        except Exception as e:
+            print(f"❌ Error starting LocalStack: {e}")
+            return False
+    
+    @classmethod
+    def stop(cls):
+        """Stop LocalStack if we started it."""
+        if not cls._started:
+            return
+        
+        if cls.KEEP_RUNNING:
+            print("\n🟡 Keeping LocalStack running (KEEP_LOCALSTACK=true)")
+            return
+        
+        print("\n🛑 Stopping LocalStack...")
+        try:
+            subprocess.run(
+                ["docker-compose", "stop", "localstack"],
+                capture_output=True,
+                check=True
+            )
+            cls._started = False
+            print("✅ LocalStack stopped")
+        except Exception as e:
+            print(f"❌ Error stopping LocalStack: {e}")
+    
+    @classmethod
+    def is_running(cls):
+        """Check if LocalStack is running and healthy."""
+        try:
+            result = subprocess.run(
+                ["curl", "-f", "http://localhost:4566/_localstack/health"],
+                capture_output=True,
+                timeout=2
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+    
+    @classmethod
+    def _create_test_bucket(cls):
+        """Ensure test bucket exists."""
+        if not BOTO3_AVAILABLE:
+            return
+        
+        try:
+            s3 = create_s3_client()
+            s3.create_bucket(Bucket=S3Config.TEST_BUCKET)
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'BucketAlreadyExists':
+                print(f"Warning: Could not create test bucket: {e}")
+
+
+# Register cleanup at exit
+def cleanup_localstack():
+    """Cleanup function to ensure LocalStack is stopped."""
+    if LocalStackManager._started:
+        LocalStackManager.stop()
+
+atexit.register(cleanup_localstack)
+
+
+class S3Config:
+    """LocalStack S3 configuration."""
+    ENDPOINT_URL = os.environ.get("LOCALSTACK_ENDPOINT", "http://localhost:4566")
+    REGION = "us-east-1"
+    ACCESS_KEY = "test"
+    SECRET_KEY = "test"
+    TEST_BUCKET = "queuepipeio-test-bucket"
+
+
+def create_s3_client():
+    """Create S3 client configured for LocalStack."""
+    if not BOTO3_AVAILABLE:
+        raise ImportError("boto3 is required for S3 tests. Install with: pip install boto3")
+    
+    return boto3.client(
+        "s3",
+        endpoint_url=S3Config.ENDPOINT_URL,
+        region_name=S3Config.REGION,
+        aws_access_key_id=S3Config.ACCESS_KEY,
+        aws_secret_access_key=S3Config.SECRET_KEY,
     )
 
 
-class TestS3Streaming(unittest.TestCase):
-    """Test S3 streaming operations with QueueIO"""
+def localstack_available():
+    """Check if LocalStack is available (will start it if needed)."""
+    if not BOTO3_AVAILABLE:
+        return False
+    
+    # Try to start LocalStack if not running
+    if not LocalStackManager.is_running():
+        if not LocalStackManager.start():
+            return False
+    
+    try:
+        s3 = create_s3_client()
+        s3.list_buckets()
+        return True
+    except Exception:
+        return False
 
+
+@skipUnless(BOTO3_AVAILABLE, "boto3 not available")
+class TestS3PipeIntegration(unittest.TestCase):
+    """Test S3 operations with the new pipe architecture."""
+    
     @classmethod
     def setUpClass(cls):
-        """Set up S3 client for all tests"""
+        """Set up S3 client and ensure LocalStack is running."""
+        # Start LocalStack if needed
+        if not localstack_available():
+            raise unittest.SkipTest("Could not start LocalStack")
+        
+        cls.s3 = create_s3_client()
+        
+        # Ensure test bucket exists
         try:
-            cls.s3_client = create_test_environment()
-            # Verify LocalStack is running
-            cls.s3_client.list_buckets()
-        except Exception as e:
-            raise unittest.SkipTest(f"LocalStack not available: {e}")
-
+            cls.s3.create_bucket(Bucket=S3Config.TEST_BUCKET)
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'BucketAlreadyExists':
+                raise
+    
     def setUp(self):
-        """Create test buckets for each test"""
-        self.source_bucket = f"test-source-{int(time.time())}"
-        self.dest_bucket = f"test-dest-{int(time.time())}"
-
-        self.s3_client.create_bucket(Bucket=self.source_bucket)
-        self.s3_client.create_bucket(Bucket=self.dest_bucket)
-
-        self.temp_files = []
-
+        """Set up for each test."""
+        self.test_keys = []
+    
     def tearDown(self):
-        """Clean up buckets and temp files"""
-        # Delete all objects and buckets
-        for bucket in [self.source_bucket, self.dest_bucket]:
+        """Clean up test objects."""
+        for key in self.test_keys:
             try:
-                # Delete all objects
-                response = self.s3_client.list_objects_v2(Bucket=bucket)
-                if "Contents" in response:
-                    for obj in response["Contents"]:
-                        self.s3_client.delete_object(Bucket=bucket, Key=obj["Key"])
-                # Delete bucket
-                self.s3_client.delete_bucket(Bucket=bucket)
+                self.s3.delete_object(Bucket=S3Config.TEST_BUCKET, Key=key)
             except Exception:
                 pass
-
-        # Clean up temp files
-        for temp_file in self.temp_files:
-            try:
-                os.unlink(temp_file)
-            except Exception:
-                pass
-
-    def test_small_file_streaming(self):
-        """Test streaming a small file (< 5MB) between buckets"""
-        # Generate 1MB test file
-        file_path, expected_md5, expected_sha256 = TestFileGenerator.create_test_file(
-            1 * 1024 * 1024
-        )
-        self.temp_files.append(file_path)
-
-        # Upload to source bucket
-        source_key = "small-test-file.bin"
-        with open(file_path, "rb") as f:
-            self.s3_client.upload_fileobj(f, self.source_bucket, source_key)
-
-        # Stream from source to destination with hash computation
-        dest_key = "small-test-file-copy.bin"
-        hasher = hashlib.sha256()
-        bytes_processed = self._stream_s3_to_s3_with_hash(
-            self.source_bucket, source_key, self.dest_bucket, dest_key, hasher
-        )
-
-        # Verify the copy
-        self.assertEqual(bytes_processed, 1 * 1024 * 1024)
-        self.assertEqual(hasher.hexdigest(), expected_sha256)
-
-        # Verify destination object exists and has correct size
-        response = self.s3_client.head_object(Bucket=self.dest_bucket, Key=dest_key)
-        self.assertEqual(response["ContentLength"], 1 * 1024 * 1024)
-
-    def test_multipart_streaming(self):
-        """Test streaming a large file requiring multipart upload"""
-        # Generate 20MB test file (requires multipart)
-        file_path, expected_md5, expected_sha256 = TestFileGenerator.create_test_file(
-            20 * 1024 * 1024
-        )
-        self.temp_files.append(file_path)
-
-        # Upload to source bucket
-        source_key = "large-test-file.bin"
-        with open(file_path, "rb") as f:
-            self.s3_client.upload_fileobj(f, self.source_bucket, source_key)
-
-        # Stream with memory limit
-        dest_key = "large-test-file-copy.bin"
-        hasher = hashlib.sha256()
-
-        # Use limited queue with 10MB memory limit
-        qio = LimitedQueueIO(
-            memory_limit=10 * 1024 * 1024,
-            chunk_size=5 * 1024 * 1024,  # 5MB chunks for S3
-            show_progress=False,
-            write_timeout=300,  # 5 minutes for large file operations
-        )
-
-        bytes_processed = self._stream_with_limited_memory(
-            self.source_bucket, source_key, self.dest_bucket, dest_key, qio, hasher
-        )
-
-        # Verify
-        self.assertEqual(bytes_processed, 20 * 1024 * 1024)
-        self.assertEqual(hasher.hexdigest(), expected_sha256)
-
-        # Check multipart upload was used (ETag format)
-        response = self.s3_client.head_object(Bucket=self.dest_bucket, Key=dest_key)
-        self.assertIn("-", response["ETag"].strip('"'))  # Multipart ETags contain '-'
-
-    def test_memory_pressure_streaming(self):
-        """Test streaming with significant memory pressure"""
-        # Generate 50MB file (reduced from 100MB for faster testing)
-        file_path, _, expected_sha256 = TestFileGenerator.create_test_file(
-            50 * 1024 * 1024
-        )
-        self.temp_files.append(file_path)
-
-        # Upload to source
-        source_key = "memory-test-file.bin"
-        with open(file_path, "rb") as f:
-            self.s3_client.upload_fileobj(f, self.source_bucket, source_key)
-
-        # Stream with only 30MB memory limit
-        dest_key = "memory-test-file-copy.bin"
-        hasher = hashlib.sha256()
-
-        qio = LimitedQueueIO(
-            memory_limit=30 * 1024 * 1024,  # Increased to 30MB for 50MB file
-            chunk_size=1 * 1024 * 1024,  # Smaller chunks (1MB) for better flow
-            show_progress=False,
-            write_timeout=None,  # No timeout to avoid deadlocks under memory pressure
-        )
-
-        start_time = time.time()
-        bytes_processed = self._stream_with_limited_memory(
-            self.source_bucket, source_key, self.dest_bucket, dest_key, qio, hasher
-        )
-        duration = time.time() - start_time
-
-        # Verify transfer completed successfully
-        self.assertEqual(bytes_processed, 50 * 1024 * 1024)
-        self.assertEqual(hasher.hexdigest(), expected_sha256)
-
-        # Calculate throughput
-        throughput_mbps = (bytes_processed / (1024 * 1024)) / duration
-        print(f"\nThroughput: {throughput_mbps:.2f} MB/s with 30MB memory limit")
-
-        # Verify the queue respected memory limits (30MB / 1MB chunks = 30)
-        self.assertEqual(qio._queue.maxsize, 30)
-
-    def test_concurrent_streaming(self):
-        """Test multiple concurrent streaming operations"""
-        # Generate test files
-        files = []
-        for i in range(3):
-            size = (i + 1) * 10 * 1024 * 1024  # 10MB, 20MB, 30MB
-            file_path, md5, sha256 = TestFileGenerator.create_test_file(size)
-            self.temp_files.append(file_path)
-            files.append(
-                {
-                    "path": file_path,
-                    "size": size,
-                    "sha256": sha256,
-                    "source_key": f"concurrent-{i}.bin",
-                    "dest_key": f"concurrent-{i}-copy.bin",
-                }
+    
+    def test_simple_s3_upload_download(self):
+        """Test basic S3 upload and download using pipes."""
+        test_key = "test-simple-upload.bin"
+        self.test_keys.append(test_key)
+        
+        # Generate test data
+        test_data = b"Hello from S3!" * 1000
+        
+        # Upload using pipe
+        writer = PipeWriter()
+        reader = PipeReader()
+        writer | reader
+        
+        # Upload thread
+        def upload_to_s3():
+            # Read from pipe and upload to S3
+            data = reader.read()
+            self.s3.put_object(
+                Bucket=S3Config.TEST_BUCKET,
+                Key=test_key,
+                Body=data
             )
-
-        # Upload all files to source bucket
-        for file_info in files:
-            with open(file_info["path"], "rb") as f:
-                self.s3_client.upload_fileobj(
-                    f, self.source_bucket, file_info["source_key"]
-                )
-
-        # Stream all files concurrently
-        threads = []
-        results = []
-
-        def stream_file(file_info, index):
-            hasher = hashlib.sha256()
-            qio = LimitedQueueIO(
-                memory_limit=15 * 1024 * 1024,  # 15MB limit per stream
-                chunk_size=1 * 1024 * 1024,  # 1MB chunks for better concurrency
-                show_progress=False,
-                write_timeout=None,  # No timeout to avoid deadlocks in concurrent operations
-            )
-
-            bytes_processed = self._stream_with_limited_memory(
-                self.source_bucket,
-                file_info["source_key"],
-                self.dest_bucket,
-                file_info["dest_key"],
-                qio,
-                hasher,
-            )
-
-            results.append(
-                {"index": index, "bytes": bytes_processed, "hash": hasher.hexdigest()}
-            )
-
-        # Start all streams
-        for i, file_info in enumerate(files):
-            thread = threading.Thread(target=stream_file, args=(file_info, i))
-            thread.start()
-            threads.append(thread)
-
-        # Wait for completion with generous timeout
-        for thread in threads:
-            thread.join(timeout=300)  # 5 minutes for concurrent operations
-            if thread.is_alive():
-                self.fail("Thread did not complete within timeout")
-
-        # Verify all transfers
-        self.assertEqual(len(results), 3)
-        for file_info in files:
-            # Find matching result
-            result = next(r for r in results if r["bytes"] == file_info["size"])
-            self.assertEqual(result["hash"], file_info["sha256"])
-
-    def test_streaming_with_errors(self):
-        """Test error handling during streaming"""
-        # Generate test file
-        file_path, _, _ = TestFileGenerator.create_test_file(10 * 1024 * 1024)
-        self.temp_files.append(file_path)
-
-        # Upload to source
-        source_key = "error-test-file.bin"
-        with open(file_path, "rb") as f:
-            self.s3_client.upload_fileobj(f, self.source_bucket, source_key)
-
-        # Try to stream to a non-existent bucket
-        with self.assertRaises(Exception):
-            hasher = hashlib.sha256()
-            self._stream_s3_to_s3_with_hash(
-                self.source_bucket,
-                source_key,
-                "non-existent-bucket",
-                "test.bin",
-                hasher,
-            )
-
-    def test_hash_verification(self):
-        """Test that computed hashes match expected values"""
-        # Generate file with known content
-        test_data = b"Hello, QueueIO!" * 100000  # ~1.9MB
-        expected_sha256 = hashlib.sha256(test_data).hexdigest()
-
-        # Create temp file
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(test_data)
-            file_path = tmp.name
-        self.temp_files.append(file_path)
-
-        # Upload to source
-        source_key = "hash-test.bin"
-        self.s3_client.put_object(
-            Bucket=self.source_bucket, Key=source_key, Body=test_data
-        )
-
-        # Stream and compute hash
-        dest_key = "hash-test-copy.bin"
-        hasher = hashlib.sha256()
-        bytes_processed = self._stream_s3_to_s3_with_hash(
-            self.source_bucket, source_key, self.dest_bucket, dest_key, hasher
-        )
-
-        # Verify hash matches
-        self.assertEqual(hasher.hexdigest(), expected_sha256)
-        self.assertEqual(bytes_processed, len(test_data))
-
-        # Download and verify content
-        response = self.s3_client.get_object(Bucket=self.dest_bucket, Key=dest_key)
-        downloaded_data = response["Body"].read()
+        
+        upload_thread = threading.Thread(target=upload_to_s3)
+        upload_thread.start()
+        
+        # Write data to pipe
+        writer.write(test_data)
+        writer.close()
+        
+        upload_thread.join()
+        
+        # Download and verify
+        response = self.s3.get_object(Bucket=S3Config.TEST_BUCKET, Key=test_key)
+        downloaded_data = response['Body'].read()
+        
         self.assertEqual(downloaded_data, test_data)
-
-    # Helper methods
-
-    def _stream_s3_to_s3_with_hash(
-        self, source_bucket, source_key, dest_bucket, dest_key, hasher
-    ):
-        """Stream from S3 to S3 using QueueIO and compute hash"""
-        qio = QueueIO(chunk_size=5 * 1024 * 1024)
-
-        bytes_processed = [0]  # Use list to avoid nonlocal in nested class
-        download_complete = False
-        upload_exception = None
-
-        def download_worker():
-            nonlocal download_complete
+    
+    def test_streaming_upload_with_hash(self):
+        """Test streaming upload with hash computation."""
+        test_key = "test-streaming-upload.bin"
+        self.test_keys.append(test_key)
+        
+        # Generate larger test data (need at least 5MB for multipart)
+        test_data = os.urandom(20 * MB)
+        expected_hash = hashlib.sha256(test_data).hexdigest()
+        
+        # Create pipeline: writer -> hasher -> reader
+        writer = PipeWriter(memory_limit=2*MB, chunk_size=512*1024)
+        hasher = HashingFilter()
+        reader = PipeReader()
+        
+        writer | hasher | reader
+        
+        # S3 upload thread
+        upload_complete = threading.Event()
+        
+        def upload_to_s3():
+            # Use multipart upload for larger file
+            upload_id = self.s3.create_multipart_upload(
+                Bucket=S3Config.TEST_BUCKET,
+                Key=test_key
+            )['UploadId']
+            
+            parts = []
+            part_number = 1
+            
             try:
-                response = self.s3_client.get_object(
-                    Bucket=source_bucket, Key=source_key
+                while True:
+                    # Read 5MB chunks for multipart (S3 minimum)
+                    chunk = reader.read(5 * MB)
+                    if not chunk:
+                        break
+                    
+                    # Upload part
+                    response = self.s3.upload_part(
+                        Bucket=S3Config.TEST_BUCKET,
+                        Key=test_key,
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=chunk
+                    )
+                    
+                    parts.append({
+                        'ETag': response['ETag'],
+                        'PartNumber': part_number
+                    })
+                    part_number += 1
+                
+                # Complete multipart upload
+                self.s3.complete_multipart_upload(
+                    Bucket=S3Config.TEST_BUCKET,
+                    Key=test_key,
+                    UploadId=upload_id,
+                    MultipartUpload={'Parts': parts}
                 )
-                for chunk in response["Body"].iter_chunks(chunk_size=1024 * 1024):
-                    qio.write(chunk)
-            finally:
-                qio.close()
-                download_complete = True
-
-        def upload_worker():
-            nonlocal upload_exception
-            handler = S3StreamHandler(self.s3_client)
-
-            try:
-                # Create a custom stream that computes hash
-                class HashingStream:
-                    def read(self, size=-1):
-                        data = qio.read(size)
-                        if data:
-                            hasher.update(data)
-                            bytes_processed[0] += len(data)
-                        return data
-
-                stream = HashingStream()
-                handler.upload_stream(stream, dest_bucket, dest_key)
-            except Exception as e:
-                upload_exception = e
-
-        # Start workers
-        download_thread = threading.Thread(target=download_worker)
-        upload_thread = threading.Thread(target=upload_worker)
-
+                upload_complete.set()
+                
+            except Exception:
+                self.s3.abort_multipart_upload(
+                    Bucket=S3Config.TEST_BUCKET,
+                    Key=test_key,
+                    UploadId=upload_id
+                )
+                raise
+        
+        # Start upload thread
+        upload_thread = threading.Thread(target=upload_to_s3)
+        upload_thread.start()
+        
+        # Write data in chunks
+        chunk_size = 256 * 1024
+        for i in range(0, len(test_data), chunk_size):
+            chunk = test_data[i:i+chunk_size]
+            writer.write(chunk)
+            time.sleep(0.0001)  # Simulate data generation
+        
+        writer.close()
+        
+        # Wait for upload to complete
+        upload_thread.join()
+        self.assertTrue(upload_complete.is_set())
+        
+        # Verify hash
+        computed_hash = hasher.get_hash()
+        self.assertEqual(computed_hash, expected_hash)
+        self.assertEqual(hasher.get_bytes_hashed(), len(test_data))
+        
+        # Download and verify data integrity
+        response = self.s3.get_object(Bucket=S3Config.TEST_BUCKET, Key=test_key)
+        downloaded_data = response['Body'].read()
+        self.assertEqual(len(downloaded_data), len(test_data))
+        self.assertEqual(hashlib.sha256(downloaded_data).hexdigest(), expected_hash)
+    
+    def test_s3_download_with_hash_verification(self):
+        """Test downloading from S3 with hash verification."""
+        test_key = "test-download-verify.bin"
+        self.test_keys.append(test_key)
+        
+        # Generate and upload test data
+        test_data = os.urandom(3 * MB)
+        expected_hash = hashlib.sha256(test_data).hexdigest()
+        
+        # Upload test data with hash in metadata
+        self.s3.put_object(
+            Bucket=S3Config.TEST_BUCKET,
+            Key=test_key,
+            Body=test_data,
+            Metadata={'sha256': expected_hash}
+        )
+        
+        # Create pipeline for download: writer -> hasher -> reader
+        writer = PipeWriter(memory_limit=1*MB)
+        hasher = HashingFilter()
+        reader = PipeReader()
+        
+        writer | hasher | reader
+        
+        # Download thread
+        def download_from_s3():
+            response = self.s3.get_object(Bucket=S3Config.TEST_BUCKET, Key=test_key)
+            body = response['Body']
+            expected = response['Metadata'].get('sha256')
+            
+            # Stream download to pipe
+            while True:
+                chunk = body.read(256 * 1024)
+                if not chunk:
+                    break
+                writer.write(chunk)
+            
+            writer.close()
+            return expected
+        
+        # Storage thread
+        downloaded_data = []
+        def store_locally():
+            while True:
+                chunk = reader.read(128 * 1024)
+                if not chunk:
+                    break
+                downloaded_data.append(chunk)
+        
+        # Run download and storage
+        download_thread = threading.Thread(target=download_from_s3)
+        storage_thread = threading.Thread(target=store_locally)
+        
+        download_thread.start()
+        storage_thread.start()
+        
+        download_thread.join()
+        storage_thread.join()
+        
+        # Verify
+        result_data = b"".join(downloaded_data)
+        self.assertEqual(len(result_data), len(test_data))
+        
+        # Verify hash
+        computed_hash = hasher.get_hash()
+        self.assertEqual(computed_hash, expected_hash)
+        self.assertEqual(hasher.get_bytes_hashed(), len(test_data))
+    
+    def test_concurrent_s3_operations(self):
+        """Test multiple concurrent S3 operations."""
+        num_files = 3
+        file_size = 1 * MB
+        
+        results = []
+        
+        def process_file(index):
+            test_key = f"test-concurrent-{index}.bin"
+            self.test_keys.append(test_key)
+            
+            # Generate unique data
+            test_data = os.urandom(file_size)
+            expected_hash = hashlib.sha256(test_data).hexdigest()
+            
+            # Create pipeline
+            writer = PipeWriter()
+            hasher = HashingFilter()
+            reader = PipeReader()
+            
+            writer | hasher | reader
+            
+            # Upload thread
+            def upload():
+                data = reader.read()
+                self.s3.put_object(
+                    Bucket=S3Config.TEST_BUCKET,
+                    Key=test_key,
+                    Body=data,
+                    Metadata={'sha256': expected_hash}
+                )
+            
+            upload_thread = threading.Thread(target=upload)
+            upload_thread.start()
+            
+            # Write data
+            writer.write(test_data)
+            writer.close()
+            
+            upload_thread.join()
+            
+            # Record result
+            results.append({
+                'key': test_key,
+                'expected_hash': expected_hash,
+                'computed_hash': hasher.get_hash(),
+                'size': file_size
+            })
+        
+        # Process files concurrently
+        threads = []
+        for i in range(num_files):
+            thread = threading.Thread(target=process_file, args=(i,))
+            threads.append(thread)
+            thread.start()
+        
+        # Wait for all to complete
+        for thread in threads:
+            thread.join()
+        
+        # Verify all uploads
+        self.assertEqual(len(results), num_files)
+        
+        for result in results:
+            # Verify hash computation
+            self.assertEqual(result['computed_hash'], result['expected_hash'])
+            
+            # Verify S3 object
+            response = self.s3.get_object(
+                Bucket=S3Config.TEST_BUCKET,
+                Key=result['key']
+            )
+            self.assertEqual(response['Metadata']['sha256'], result['expected_hash'])
+            self.assertEqual(response['ContentLength'], result['size'])
+    
+    def test_s3_copy_with_transformation(self):
+        """Test copying S3 object with hash computation."""
+        source_key = "test-copy-source.bin"
+        dest_key = "test-copy-dest.bin"
+        self.test_keys.extend([source_key, dest_key])
+        
+        # Upload source object
+        test_data = os.urandom(2 * MB)
+        self.s3.put_object(
+            Bucket=S3Config.TEST_BUCKET,
+            Key=source_key,
+            Body=test_data
+        )
+        
+        # Create pipeline for copy operation
+        writer = PipeWriter(memory_limit=1*MB)
+        hasher = HashingFilter()
+        reader = PipeReader()
+        
+        writer | hasher | reader
+        
+        # Download from source
+        def download_source():
+            response = self.s3.get_object(Bucket=S3Config.TEST_BUCKET, Key=source_key)
+            body = response['Body']
+            
+            while True:
+                chunk = body.read(256 * 1024)
+                if not chunk:
+                    break
+                writer.write(chunk)
+            
+            writer.close()
+        
+        # Upload to destination
+        def upload_dest():
+            data_chunks = []
+            while True:
+                chunk = reader.read(512 * 1024)
+                if not chunk:
+                    break
+                data_chunks.append(chunk)
+            
+            data = b"".join(data_chunks)
+            computed_hash = hasher.get_hash()
+            
+            self.s3.put_object(
+                Bucket=S3Config.TEST_BUCKET,
+                Key=dest_key,
+                Body=data,
+                Metadata={'sha256': computed_hash}
+            )
+            
+            return computed_hash
+        
+        # Run copy operation
+        download_thread = threading.Thread(target=download_source)
+        upload_thread = threading.Thread(target=upload_dest)
+        
         download_thread.start()
         upload_thread.start()
-
-        # Wait for completion with generous timeout
-        download_thread.join(timeout=300)
-        upload_thread.join(timeout=300)
-
-        # Check if threads completed
-        if download_thread.is_alive() or upload_thread.is_alive():
-            raise TimeoutError("Threads did not complete within timeout")
-
-        if upload_exception:
-            raise upload_exception
-
-        return bytes_processed[0]
-
-    def _stream_with_limited_memory(
-        self, source_bucket, source_key, dest_bucket, dest_key, qio, hasher
-    ):
-        """Stream using a pre-configured LimitedQueueIO instance"""
-        bytes_processed = [0]  # Use list to avoid nonlocal in nested class
-        exception = None
-
-        def download_worker():
-            try:
-                response = self.s3_client.get_object(
-                    Bucket=source_bucket, Key=source_key
-                )
-                # Use the same chunk size as the QueueIO to avoid buffering issues
-                for chunk in response["Body"].iter_chunks(chunk_size=qio._chunk_size):
-                    qio.write(chunk)
-            except Exception as e:
-                nonlocal exception
-                exception = e
-            finally:
-                qio.close()
-
-        def upload_worker():
-            handler = S3StreamHandler(self.s3_client)
-
-            try:
-                # Hash-computing stream
-                class HashingStream:
-                    def read(self, size=-1):
-                        data = qio.read(size)
-                        if data:
-                            hasher.update(data)
-                            bytes_processed[0] += len(data)
-                        return data
-
-                stream = HashingStream()
-                handler.upload_stream(
-                    stream, dest_bucket, dest_key, part_size=5 * 1024 * 1024
-                )
-            except Exception as e:
-                nonlocal exception
-                if not exception:
-                    exception = e
-
-        # Start workers
-        download_thread = threading.Thread(target=download_worker)
-        upload_thread = threading.Thread(target=upload_worker)
-
-        download_thread.start()
-        upload_thread.start()
-
-        # Wait for completion with generous timeout
-        download_thread.join(timeout=300)
-        upload_thread.join(timeout=300)
-
-        # Check if threads completed
-        if download_thread.is_alive() or upload_thread.is_alive():
-            raise TimeoutError("Threads did not complete within timeout")
-
-        if exception:
-            raise exception
-
-        return bytes_processed[0]
+        
+        download_thread.join()
+        upload_thread.join()
+        
+        # Verify copy
+        source_obj = self.s3.get_object(Bucket=S3Config.TEST_BUCKET, Key=source_key)
+        dest_obj = self.s3.get_object(Bucket=S3Config.TEST_BUCKET, Key=dest_key)
+        
+        self.assertEqual(source_obj['ContentLength'], dest_obj['ContentLength'])
+        
+        # Verify hash was computed correctly
+        expected_hash = hashlib.sha256(test_data).hexdigest()
+        self.assertEqual(hasher.get_hash(), expected_hash)
+        self.assertEqual(dest_obj['Metadata']['sha256'], expected_hash)
 
 
-class TestS3StreamHandler(unittest.TestCase):
-    """Test the S3StreamHandler utility class"""
-
+@skipUnless(BOTO3_AVAILABLE, "boto3 not available")
+class TestS3Performance(unittest.TestCase):
+    """Performance tests for S3 operations."""
+    
     @classmethod
     def setUpClass(cls):
-        """Set up S3 client"""
+        """Set up S3 client and ensure LocalStack is running."""
+        # Start LocalStack if needed
+        if not localstack_available():
+            raise unittest.SkipTest("Could not start LocalStack")
+        
+        cls.s3 = create_s3_client()
+    
+    def test_large_file_performance(self):
+        """Test performance with large file transfers."""
+        test_key = "test-performance-large.bin"
+        file_size = 10 * MB
+        
+        # Generate test data
+        test_data = os.urandom(file_size)
+        
+        # Create pipeline with memory limit
+        writer = PipeWriter(memory_limit=5*MB, chunk_size=1*MB)
+        hasher = HashingFilter()
+        reader = PipeReader()
+        
+        writer | hasher | reader
+        
+        # Measure upload time
+        start_time = time.time()
+        
+        # Upload thread
+        upload_complete = threading.Event()
+        
+        def upload_worker():
+            data_chunks = []
+            while True:
+                chunk = reader.read(2 * MB)
+                if not chunk:
+                    break
+                data_chunks.append(chunk)
+            
+            # Single PUT for performance test
+            self.s3.put_object(
+                Bucket=S3Config.TEST_BUCKET,
+                Key=test_key,
+                Body=b"".join(data_chunks)
+            )
+            upload_complete.set()
+        
+        upload_thread = threading.Thread(target=upload_worker)
+        upload_thread.start()
+        
+        # Write data
+        writer.write(test_data)
+        writer.close()
+        
+        upload_thread.join()
+        upload_time = time.time() - start_time
+        
+        # Calculate throughput
+        throughput_mbps = (file_size / MB) / upload_time
+        print(f"\nUpload throughput: {throughput_mbps:.2f} MB/s")
+        
+        # Verify hash
+        expected_hash = hashlib.sha256(test_data).hexdigest()
+        self.assertEqual(hasher.get_hash(), expected_hash)
+        
+        # Clean up
         try:
-            cls.s3_client = create_test_environment()
-            cls.s3_client.list_buckets()
-        except Exception as e:
-            raise unittest.SkipTest(f"LocalStack not available: {e}")
-
-    def setUp(self):
-        """Create test bucket"""
-        self.test_bucket = f"handler-test-{int(time.time())}"
-        self.s3_client.create_bucket(Bucket=self.test_bucket)
-        self.handler = S3StreamHandler(self.s3_client)
-        self.temp_files = []
-
-    def tearDown(self):
-        """Clean up"""
-        # Delete bucket contents
-        try:
-            response = self.s3_client.list_objects_v2(Bucket=self.test_bucket)
-            if "Contents" in response:
-                for obj in response["Contents"]:
-                    self.s3_client.delete_object(
-                        Bucket=self.test_bucket, Key=obj["Key"]
-                    )
-            self.s3_client.delete_bucket(Bucket=self.test_bucket)
+            self.s3.delete_object(Bucket=S3Config.TEST_BUCKET, Key=test_key)
         except Exception:
             pass
-
-        # Clean up temp files
-        for f in self.temp_files:
-            try:
-                os.unlink(f)
-            except Exception:
-                pass
-
-    def test_upload_download_cycle(self):
-        """Test upload and download using stream handler"""
-        # Create test data
-        test_data = b"Test data for S3StreamHandler" * 1000
-        stream = BytesIO(test_data)
-
-        # Upload
-        self.handler.upload_stream(stream, self.test_bucket, "test-object")
-
-        # Download
-        output = BytesIO()
-        self.handler.download_stream(self.test_bucket, "test-object", output)
-
-        # Verify
-        self.assertEqual(output.getvalue(), test_data)
-
-    def test_multipart_upload_with_handler(self):
-        """Test multipart upload through handler"""
-        # Create 10MB test file
-        file_path, _, _ = TestFileGenerator.create_test_file(10 * 1024 * 1024)
-        self.temp_files.append(file_path)
-
-        # Upload using handler
-        with open(file_path, "rb") as f:
-            self.handler.upload_stream(
-                f, self.test_bucket, "multipart-test", part_size=5 * 1024 * 1024
-            )
-
-        # Verify object exists and has multipart ETag
-        response = self.s3_client.head_object(
-            Bucket=self.test_bucket, Key="multipart-test"
-        )
-        self.assertIn("-", response["ETag"].strip('"'))
+        
+        # Performance assertion (at least 10 MB/s with LocalStack)
+        self.assertGreater(throughput_mbps, 10.0)
 
 
 if __name__ == "__main__":
+    # LocalStack will be started automatically by the tests
     unittest.main()
