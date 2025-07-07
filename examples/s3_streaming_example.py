@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Example: Stream files between S3 buckets with custom hash using QueuePipeIO
+Example: Stream files between S3 buckets using the new pipe architecture
 
 This example demonstrates how to efficiently stream large files from one S3 bucket
 to another while computing a SHA256 hash, all with limited memory usage.
 """
 
-import hashlib
 import threading
 import time
-from queuepipeio import QueueIO, LimitedQueueIO
+import sys
+import os
+
+# Add parent directory to path if running from examples directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from queuepipeio import PipeWriter, PipeReader, HashingFilter
 
 
 def stream_s3_to_s3_with_hash(
@@ -31,148 +36,157 @@ def stream_s3_to_s3_with_hash(
     """
     start_time = time.time()
 
-    # Create QueueIO with memory limit
-    qio = LimitedQueueIO(
+    # Create pipeline: writer -> hasher -> reader
+    writer = PipeWriter(
         memory_limit=memory_limit_mb * 1024 * 1024,
         chunk_size=5 * 1024 * 1024,  # 5MB chunks (S3 multipart minimum)
         show_progress=True,  # Show progress bar
-        write_timeout=30,  # 30 second timeout if queue is full
     )
+    hasher = HashingFilter(algorithm='sha256')
+    reader = PipeReader()
+    
+    # Connect components
+    writer | hasher | reader
 
-    # Hash object for computing SHA256
-    hasher = hashlib.sha256()
-    bytes_processed = [0]  # Use list to avoid nonlocal in nested class
-    exception = [None]
+    bytes_transferred = 0
+    exception = None
 
     def download_worker():
-        """Download from S3 and write to queue"""
+        """Download from S3 and write to pipe"""
+        nonlocal exception
         try:
             print(f"Downloading {source_bucket}/{source_key}...")
+            
+            # Get object and stream it
             response = s3_client.get_object(Bucket=source_bucket, Key=source_key)
-
-            # Stream the body in chunks
-            for chunk in response["Body"].iter_chunks(chunk_size=1024 * 1024):
-                qio.write(chunk)
-
+            body = response['Body']
+            
+            # Stream chunks to pipe
+            while True:
+                chunk = body.read(1024 * 1024)  # Read 1MB at a time
+                if not chunk:
+                    break
+                writer.write(chunk)
+                
         except Exception as e:
-            exception[0] = e
+            exception = e
             print(f"Download error: {e}")
         finally:
-            qio.close()
+            writer.close()
 
     def upload_worker():
-        """Read from queue and upload to S3 with multipart"""
+        """Read from pipe and upload to S3"""
+        nonlocal bytes_transferred, exception
         try:
             print(f"Uploading to {dest_bucket}/{dest_key}...")
-
-            # Start multipart upload
-            upload = s3_client.create_multipart_upload(Bucket=dest_bucket, Key=dest_key)
-            upload_id = upload["UploadId"]
+            
+            # Initialize multipart upload
+            response = s3_client.create_multipart_upload(
+                Bucket=dest_bucket,
+                Key=dest_key
+            )
+            upload_id = response['UploadId']
+            
             parts = []
             part_number = 1
-
-            try:
-                while True:
-                    # Read 5MB chunks for multipart
-                    chunk = qio.read(5 * 1024 * 1024)
-                    if not chunk:
-                        break
-
-                    # Update hash
-                    hasher.update(chunk)
-                    bytes_processed[0] += len(chunk)
-
-                    # Upload part
-                    response = s3_client.upload_part(
-                        Bucket=dest_bucket,
-                        Key=dest_key,
-                        PartNumber=part_number,
-                        UploadId=upload_id,
-                        Body=chunk,
-                    )
-
-                    parts.append({"PartNumber": part_number, "ETag": response["ETag"]})
-                    part_number += 1
-
-                # Complete multipart upload
-                s3_client.complete_multipart_upload(
+            
+            # Upload parts
+            while True:
+                # Read 5MB chunks for multipart upload
+                chunk = reader.read(5 * 1024 * 1024)
+                if not chunk:
+                    break
+                
+                # Upload part
+                response = s3_client.upload_part(
                     Bucket=dest_bucket,
                     Key=dest_key,
+                    PartNumber=part_number,
                     UploadId=upload_id,
-                    MultipartUpload={"Parts": parts},
+                    Body=chunk
                 )
-                print(f"Upload complete: {part_number-1} parts")
-
-            except Exception as e:
-                # Abort multipart upload on error
-                s3_client.abort_multipart_upload(
-                    Bucket=dest_bucket, Key=dest_key, UploadId=upload_id
-                )
-                raise e
-
+                
+                parts.append({
+                    'ETag': response['ETag'],
+                    'PartNumber': part_number
+                })
+                
+                bytes_transferred += len(chunk)
+                part_number += 1
+            
+            # Complete multipart upload
+            s3_client.complete_multipart_upload(
+                Bucket=dest_bucket,
+                Key=dest_key,
+                UploadId=upload_id,
+                MultipartUpload={'Parts': parts}
+            )
+            
+            print(f"Upload complete: {bytes_transferred / (1024*1024):.1f} MB")
+            
         except Exception as e:
-            exception[0] = e
+            exception = e
             print(f"Upload error: {e}")
+            # Abort multipart upload on error
+            if 'upload_id' in locals():
+                s3_client.abort_multipart_upload(
+                    Bucket=dest_bucket,
+                    Key=dest_key,
+                    UploadId=upload_id
+                )
 
     # Start workers
     download_thread = threading.Thread(target=download_worker)
     upload_thread = threading.Thread(target=upload_worker)
-
+    
     download_thread.start()
     upload_thread.start()
-
+    
     # Wait for completion
     download_thread.join()
     upload_thread.join()
-
-    # Check for errors
-    if exception[0]:
-        raise exception[0]
-
+    
+    if exception:
+        raise exception
+    
     duration = time.time() - start_time
-
-    # Calculate throughput
-    throughput_mbps = (bytes_processed[0] / (1024 * 1024)) / duration
-    print(f"\nTransfer complete!")
-    print(f"  Bytes: {bytes_processed[0]:,}")
-    print(f"  Duration: {duration:.2f}s")
-    print(f"  Throughput: {throughput_mbps:.2f} MB/s")
-    print(f"  SHA256: {hasher.hexdigest()}")
-
-    return hasher.hexdigest(), bytes_processed[0], duration
+    sha256_hash = hasher.get_hash()
+    
+    return sha256_hash, bytes_transferred, duration
 
 
-def example_usage():
-    """Example usage with boto3"""
+def main():
+    """Example usage"""
     import boto3
-
-    # Configure S3 client
-    # For LocalStack: endpoint_url='http://localhost:4566'
-    # For AWS: use your credentials
-    s3 = boto3.client("s3")
-
-    # Example parameters
-    source_bucket = "my-source-bucket"
-    source_key = "large-file.zip"
-    dest_bucket = "my-dest-bucket"
-    dest_key = "large-file-copy.zip"
-
+    
+    # Configure S3 client (adjust for your environment)
+    s3 = boto3.client('s3',
+        endpoint_url='http://localhost:4566',  # LocalStack endpoint
+        aws_access_key_id='test',
+        aws_secret_access_key='test',
+        region_name='us-east-1'
+    )
+    
+    # Example usage
     try:
-        # Stream with 50MB memory limit
-        hash_value, total_bytes, duration = stream_s3_to_s3_with_hash(
-            s3, source_bucket, source_key, dest_bucket, dest_key, memory_limit_mb=50
+        hash_value, bytes_transferred, duration = stream_s3_to_s3_with_hash(
+            s3,
+            source_bucket='my-source-bucket',
+            source_key='large-file.bin',
+            dest_bucket='my-dest-bucket', 
+            dest_key='large-file-copy.bin',
+            memory_limit_mb=50  # Use only 50MB of memory
         )
-
-        print(f"\nSuccess! File hash: {hash_value}")
-
+        
+        print(f"\nTransfer complete!")
+        print(f"SHA256: {hash_value}")
+        print(f"Bytes transferred: {bytes_transferred:,}")
+        print(f"Duration: {duration:.2f} seconds")
+        print(f"Throughput: {bytes_transferred / (1024*1024) / duration:.2f} MB/s")
+        
     except Exception as e:
         print(f"Error: {e}")
 
 
 if __name__ == "__main__":
-    print(__doc__)
-    print(
-        "\nNote: This is an example. Configure the S3 client and bucket names for your environment."
-    )
-    print("To run the example, uncomment the line below and update the parameters.\n")
-    # example_usage()
+    main()
