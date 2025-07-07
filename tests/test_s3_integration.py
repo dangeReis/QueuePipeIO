@@ -8,19 +8,32 @@ and respecting memory limits.
 
 import unittest
 import os
+import sys
 import time
 import threading
 import hashlib
 import tempfile
 from io import BytesIO
 
+# Add parent directory to path for queuepipeio import
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from queuepipeio import QueueIO, LimitedQueueIO
 
-from .s3_test_utils import (
-    S3StreamHandler,
-    TestFileGenerator,
-    create_test_environment,
-)
+try:
+    # Try relative import first (when run as package)
+    from .s3_test_utils import (
+        S3StreamHandler,
+        TestFileGenerator,
+        create_test_environment,
+    )
+except ImportError:
+    # Fall back to absolute import (when run directly or by VSCode)
+    from s3_test_utils import (
+        S3StreamHandler,
+        TestFileGenerator,
+        create_test_environment,
+    )
 
 
 class TestS3Streaming(unittest.TestCase):

@@ -7,8 +7,15 @@ import threading
 from typing import Optional, Tuple, Dict, Any, BinaryIO
 from contextlib import contextmanager
 
-import boto3
-from botocore.exceptions import ClientError
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+    BOTO3_AVAILABLE = True
+except ImportError:
+    boto3 = None
+    ClientError = None
+    BOTO3_AVAILABLE = False
+
 from queuepipeio import QueueIO, LimitedQueueIO
 
 
@@ -146,8 +153,11 @@ class S3ClientHelper:
     """Helper for creating and managing S3 clients."""
 
     @staticmethod
-    def create_client(**kwargs) -> boto3.client:
+    def create_client(**kwargs):
         """Create S3 client configured for LocalStack."""
+        if not BOTO3_AVAILABLE:
+            raise ImportError("boto3 is required for S3 tests. Install with: pip install boto3")
+        
         config = {
             "endpoint_url": S3TestConfig.ENDPOINT_URL,
             "region_name": S3TestConfig.REGION,
@@ -385,6 +395,8 @@ class S3StreamHandler:
 # Convenience functions
 def create_test_environment():
     """Create a complete test environment with S3 client and test bucket."""
+    if not BOTO3_AVAILABLE:
+        raise ImportError("boto3 is required for S3 tests. Install with: pip install boto3")
     client = S3ClientHelper.create_client()
     return client
 

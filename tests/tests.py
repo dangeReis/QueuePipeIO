@@ -1,5 +1,10 @@
 import threading
 import unittest
+import sys
+import os
+
+# Add parent directory to path for queuepipeio import
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from queuepipeio import LimitedQueueIO, QueueIO  # Updated import statements
 

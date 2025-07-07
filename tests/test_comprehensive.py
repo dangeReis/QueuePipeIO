@@ -2,9 +2,15 @@ import unittest
 import threading
 import time
 import queue
+import sys
+import os
 from io import BytesIO
 
-from queuepipeio import QueueIO, LimitedQueueIO, MB
+# Add parent directory to path for queuepipeio import
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from queuepipeio import QueueIO, LimitedQueueIO
+MB = 1024 * 1024  # Define MB constant
 
 
 class TestQueueIOChunking(unittest.TestCase):
