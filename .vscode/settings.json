@@ -4,11 +4,9 @@
     "python.testing.unittestArgs": [
         "-v",
         "-s",
-        "${workspaceFolder}/tests",
+        "tests",
         "-p",
-        "test_*.py",
-        "-t",
-        "${workspaceFolder}"
+        "test*.py"
     ],
     "python.envFile": "${workspaceFolder}/.env",
     "python.terminal.activateEnvironment": true,
