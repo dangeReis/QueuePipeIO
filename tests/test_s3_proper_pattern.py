@@ -39,25 +39,25 @@ except ImportError:
 
 class HashingQueueIO(QueueIO):
     """QueueIO that computes hash of data passing through"""
-    
-    def __init__(self, hash_algorithm='sha256', *args, **kwargs):
+
+    def __init__(self, hash_algorithm="sha256", *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._hasher = hashlib.new(hash_algorithm)
         self._hash_lock = threading.Lock()
         self._bytes_hashed = 0
-        
+
     def write(self, b):
         """Write data and update hash"""
         with self._hash_lock:
             self._hasher.update(b)
             self._bytes_hashed += len(b)
         return super().write(b)
-    
+
     def get_hash(self):
         """Get the computed hash (hexdigest)"""
         with self._hash_lock:
             return self._hasher.hexdigest()
-    
+
     def get_bytes_hashed(self):
         """Get the number of bytes hashed"""
         with self._hash_lock:
@@ -66,25 +66,25 @@ class HashingQueueIO(QueueIO):
 
 class LimitedHashingQueueIO(LimitedQueueIO):
     """Memory-limited QueueIO with hash computation"""
-    
-    def __init__(self, hash_algorithm='sha256', **kwargs):
+
+    def __init__(self, hash_algorithm="sha256", **kwargs):
         super().__init__(**kwargs)
         self._hasher = hashlib.new(hash_algorithm)
         self._hash_lock = threading.Lock()
         self._bytes_hashed = 0
-        
+
     def write(self, b):
         """Write data and update hash"""
         with self._hash_lock:
             self._hasher.update(b)
             self._bytes_hashed += len(b)
         return super().write(b)
-    
+
     def get_hash(self):
         """Get the computed hash (hexdigest)"""
         with self._hash_lock:
             return self._hasher.hexdigest()
-    
+
     def get_bytes_hashed(self):
         """Get the number of bytes hashed"""
         with self._hash_lock:
@@ -146,10 +146,10 @@ class TestS3ProperPattern(unittest.TestCase):
 
         # Create HashingQueueIO with memory limit
         hashing_queue = LimitedHashingQueueIO(
-            hash_algorithm='sha256',
+            hash_algorithm="sha256",
             memory_limit=10 * 1024 * 1024,  # 10MB limit for 25MB file
-            chunk_size=2 * 1024 * 1024,     # 2MB chunks
-            show_progress=False
+            chunk_size=2 * 1024 * 1024,  # 2MB chunks
+            show_progress=False,
         )
 
         dest_key = "proper-pattern-copy.bin"
@@ -161,13 +161,14 @@ class TestS3ProperPattern(unittest.TestCase):
             nonlocal exception
             try:
                 response = self.s3_client.get_object(
-                    Bucket=self.source_bucket,
-                    Key=source_key
+                    Bucket=self.source_bucket, Key=source_key
                 )
                 # S3 downloads and writes to our hashing queue
                 for chunk in response["Body"].iter_chunks(chunk_size=1024 * 1024):
                     hashing_queue.write(chunk)
-                print(f"Download complete, wrote {hashing_queue.get_bytes_hashed() / (1024*1024):.1f}MB")
+                print(
+                    f"Download complete, wrote {hashing_queue.get_bytes_hashed() / (1024*1024):.1f}MB"
+                )
             except Exception as e:
                 exception = e
             finally:
@@ -178,16 +179,16 @@ class TestS3ProperPattern(unittest.TestCase):
             nonlocal exception, bytes_transferred
             try:
                 handler = S3StreamHandler(self.s3_client)
-                
+
                 # S3 uploads by reading from our hashing queue
                 # The queue is already computing the hash!
                 handler.upload_stream(
                     hashing_queue,  # Direct stream from queue
                     self.dest_bucket,
                     dest_key,
-                    part_size=5 * 1024 * 1024
+                    part_size=5 * 1024 * 1024,
                 )
-                
+
                 bytes_transferred = hashing_queue.get_bytes_hashed()
                 print(f"Upload complete, read {bytes_transferred / (1024*1024):.1f}MB")
             except Exception as e:
@@ -196,7 +197,7 @@ class TestS3ProperPattern(unittest.TestCase):
 
         # Start both operations
         start_time = time.time()
-        
+
         download_thread = threading.Thread(target=s3_download_to_queue)
         upload_thread = threading.Thread(target=s3_upload_from_queue)
 
@@ -220,7 +221,9 @@ class TestS3ProperPattern(unittest.TestCase):
         print(f"  Throughput: {throughput_mbps:.2f} MB/s")
         print(f"  Computed hash: {computed_hash[:32]}...")
         print(f"  Expected hash: {expected_sha256[:32]}...")
-        print(f"  Memory used: {hashing_queue._queue.maxsize * hashing_queue._chunk_size / (1024*1024):.1f}MB")
+        print(
+            f"  Memory used: {hashing_queue._queue.maxsize * hashing_queue._chunk_size / (1024*1024):.1f}MB"
+        )
 
         # Verify results
         self.assertEqual(bytes_transferred, file_size)
@@ -233,7 +236,7 @@ class TestS3ProperPattern(unittest.TestCase):
     def test_batch_transfer_with_hashes(self):
         """Test transferring multiple files with hash computation"""
         files = [
-            {"name": "file1.bin", "size": 5 * 1024 * 1024},   # 5MB
+            {"name": "file1.bin", "size": 5 * 1024 * 1024},  # 5MB
             {"name": "file2.bin", "size": 10 * 1024 * 1024},  # 10MB
             {"name": "file3.bin", "size": 15 * 1024 * 1024},  # 15MB
         ]
@@ -243,12 +246,12 @@ class TestS3ProperPattern(unittest.TestCase):
         for file_info in files:
             file_path, _, sha256 = TestFileGenerator.create_test_file(file_info["size"])
             self.temp_files.append(file_path)
-            
+
             file_metadata[file_info["name"]] = {
                 "size": file_info["size"],
                 "expected_hash": sha256,
                 "computed_hash": None,
-                "throughput": None
+                "throughput": None,
             }
 
             with open(file_path, "rb") as f:
@@ -256,19 +259,20 @@ class TestS3ProperPattern(unittest.TestCase):
 
         # Transfer each file with hash computation
         for file_name, metadata in file_metadata.items():
-            print(f"\nTransferring {file_name} ({metadata['size'] / (1024*1024):.1f}MB)...")
-            
+            print(
+                f"\nTransferring {file_name} ({metadata['size'] / (1024*1024):.1f}MB)..."
+            )
+
             # Create a fresh hashing queue for each file
             hashing_queue = HashingQueueIO(chunk_size=2 * 1024 * 1024)
-            
+
             exception = None
-            
+
             def download():
                 nonlocal exception
                 try:
                     response = self.s3_client.get_object(
-                        Bucket=self.source_bucket,
-                        Key=file_name
+                        Bucket=self.source_bucket, Key=file_name
                     )
                     for chunk in response["Body"].iter_chunks(chunk_size=512 * 1024):
                         hashing_queue.write(chunk)
@@ -285,25 +289,25 @@ class TestS3ProperPattern(unittest.TestCase):
                         hashing_queue,
                         self.dest_bucket,
                         f"hashed-{file_name}",
-                        part_size=5 * 1024 * 1024
+                        part_size=5 * 1024 * 1024,
                     )
                 except Exception as e:
                     if not exception:
                         exception = e
 
             start_time = time.time()
-            
+
             dl_thread = threading.Thread(target=download)
             ul_thread = threading.Thread(target=upload)
-            
+
             dl_thread.start()
             ul_thread.start()
-            
+
             dl_thread.join()
             ul_thread.join()
-            
+
             duration = time.time() - start_time
-            
+
             if exception:
                 raise exception
 
@@ -320,14 +324,16 @@ class TestS3ProperPattern(unittest.TestCase):
             self.assertEqual(
                 metadata["computed_hash"],
                 metadata["expected_hash"],
-                f"Hash mismatch for {file_name}"
+                f"Hash mismatch for {file_name}",
             )
             print(f"  {file_name}: Hash verified ✓")
 
         # Calculate total throughput
         total_size = sum(m["size"] for m in file_metadata.values())
-        avg_throughput = sum(m["throughput"] for m in file_metadata.values()) / len(file_metadata)
-        
+        avg_throughput = sum(m["throughput"] for m in file_metadata.values()) / len(
+            file_metadata
+        )
+
         print(f"\nTotal data transferred: {total_size / (1024*1024):.1f}MB")
         print(f"Average throughput: {avg_throughput:.2f} MB/s")
 

@@ -195,12 +195,12 @@ class QueueIO(io.RawIOBase):
 
     def close(self):
         """Close the queue for writing (standard producer-consumer pattern)
-        
+
         This method closes the write side and sends EOF to readers.
         For complete closure of both sides, use close_all().
         """
         self.close_write()
-        
+
     def close_write(self):
         """Close the queue for writing (producer side) only"""
         # First check if already closed without holding any locks
@@ -259,27 +259,27 @@ class QueueIO(io.RawIOBase):
         with self._read_lock:
             self._read_closed = True
             self._buffer = b""  # Clear any remaining buffer
-            
+
     def close_all(self):
         """Close the queue completely (both reading and writing)
-        
+
         Use this when QueueIO is used as a regular file-like object
         that needs complete cleanup.
         """
         # First close writing side
         self.close_write()
-        
+
         # Then close reading side
         with self._read_lock:
             self._read_closed = True
             self._buffer = b""  # Clear any remaining buffer
-            
+
         # Mark as fully closed
         self._fully_closed = True
-        
+
         # Now we can close the underlying I/O object
         super().close()
-            
+
     def seekable(self):
         """Indicate that this object is not seekable"""
         return False
@@ -412,8 +412,95 @@ class LimitedQueueIO(QueueIO):
             self.status_bar.close()
 
 
+class HashingLimitedQueueIO(LimitedQueueIO):
+    """
+    A LimitedQueueIO that computes hash of data as it's read.
+
+    This class computes the hash on the consumer side (during read operations),
+    which is useful when:
+    - Different consumers need different hash algorithms
+    - The producer shouldn't know about hashing requirements
+    - You want to verify data integrity on the consumer side
+
+    Args:
+        hash_algorithm (str): Hash algorithm to use (default: 'sha256')
+        memory_limit (int, optional): Maximum memory limit in bytes
+        chunk_size (int, optional): Size of each chunk in bytes
+        show_progress (bool, optional): Whether to show a progress bar
+        write_timeout (float, optional): Timeout for write operations
+    """
+
+    def __init__(self, hash_algorithm="sha256", **kwargs):
+        """Initialize with hash algorithm and standard LimitedQueueIO parameters."""
+        super().__init__(**kwargs)
+
+        import hashlib
+
+        self._hasher = hashlib.new(hash_algorithm)
+        self._hash_lock = threading.Lock()
+        self._bytes_hashed = 0
+        self._hash_algorithm = hash_algorithm
+
+    def read(self, n=-1):
+        """
+        Read data from the queue and update hash.
+
+        Args:
+            n (int, optional): Number of bytes to read. -1 means read all.
+
+        Returns:
+            bytes: The data read from the queue.
+        """
+        # Get data from parent
+        data = super().read(n)
+
+        # Update hash with the data we're returning
+        if data:
+            with self._hash_lock:
+                self._hasher.update(data)
+                self._bytes_hashed += len(data)
+
+        return data
+
+    def get_hash(self):
+        """
+        Get the computed hash as hexdigest.
+
+        Returns:
+            str: Hexadecimal digest of the hash.
+        """
+        with self._hash_lock:
+            return self._hasher.hexdigest()
+
+    def get_bytes_hashed(self):
+        """
+        Get the number of bytes that have been hashed.
+
+        Returns:
+            int: Number of bytes hashed so far.
+        """
+        with self._hash_lock:
+            return self._bytes_hashed
+
+    def reset_hash(self):
+        """Reset the hash computation to start fresh."""
+        import hashlib
+
+        with self._hash_lock:
+            self._hasher = hashlib.new(self._hash_algorithm)
+            self._bytes_hashed = 0
+
+
 # Export names to maintain backward compatibility
 QueuePipeIO = QueueIO
 LimitedQueuePipeIO = LimitedQueueIO
+HashingQueuePipeIO = HashingLimitedQueueIO  # Alias for consistency
 
-__all__ = ["QueueIO", "LimitedQueueIO", "QueuePipeIO", "LimitedQueuePipeIO"]
+__all__ = [
+    "QueueIO",
+    "LimitedQueueIO",
+    "QueuePipeIO",
+    "LimitedQueuePipeIO",
+    "HashingLimitedQueueIO",
+    "HashingQueuePipeIO",
+]

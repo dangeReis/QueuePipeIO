@@ -4,15 +4,30 @@
 
 QueueIO should be used as a streaming pipeline where:
 
-1. **Writer** (e.g., S3 download) → writes to → **QueueIO** (computes hash) → read by → **Reader** (e.g., S3 upload)
+1. **Writer** (e.g., S3 download) → writes to → **QueueIO** → read by → **Reader** (e.g., S3 upload)
 
 The key insight is that QueueIO sits in the middle of the data flow, allowing you to:
 - Stream data without buffering the entire file
-- Compute hashes/checksums as data flows through
+- Compute hashes/checksums as data flows through (either during write OR read)
 - Control memory usage with LimitedQueueIO
 - Handle backpressure automatically
 
-## Example: S3 to S3 Transfer with Hash
+## Hash Computation Options
+
+### Write-Side Hashing (Producer computes hash)
+Best when:
+- Hash is computed once and used by multiple consumers
+- Producer needs to log/verify the hash
+- All consumers need the same hash algorithm
+
+### Read-Side Hashing (Consumer computes hash) - NEW!
+Best when:
+- Different consumers need different hash algorithms
+- Producer shouldn't know about hashing requirements  
+- You want to verify data integrity on the consumer side
+- Hash computation should be decoupled from data production
+
+## Example: Write-Side Hashing (Producer computes hash)
 
 ```python
 from queuepipeio import LimitedQueueIO
@@ -20,7 +35,7 @@ import hashlib
 import threading
 
 class HashingQueueIO(LimitedQueueIO):
-    """QueueIO that computes hash of data passing through"""
+    """QueueIO that computes hash of data passing through during write"""
     
     def __init__(self, hash_algorithm='sha256', **kwargs):
         super().__init__(**kwargs)
@@ -71,6 +86,49 @@ upload_thread.join()
 
 # Hash is now available!
 print(f"File hash: {hashing_queue.get_hash()}")
+```
+
+## Example: Read-Side Hashing (Consumer computes hash) - NEW!
+
+```python
+from queuepipeio import HashingLimitedQueueIO
+import threading
+
+# Built-in class that computes hash during read operations
+hashing_queue = HashingLimitedQueueIO(
+    hash_algorithm='sha256',         # Choose your algorithm  
+    memory_limit=10 * 1024 * 1024,   # 10MB memory limit
+    chunk_size=2 * 1024 * 1024,      # 2MB chunks
+)
+
+def download_from_s3():
+    """S3 download just writes data - no hash computation"""
+    response = s3_client.get_object(Bucket='source-bucket', Key='file.bin')
+    for chunk in response['Body'].iter_chunks(chunk_size=1024*1024):
+        hashing_queue.write(chunk)  # Just write, no hashing here
+    hashing_queue.close()
+
+def verify_and_save():
+    """Consumer reads data and hash is computed automatically"""
+    with open('output.bin', 'wb') as f:
+        while True:
+            chunk = hashing_queue.read(512*1024)  # Hash computed here!
+            if not chunk:
+                break
+            f.write(chunk)
+    
+    # Get the hash computed during reading
+    computed_hash = hashing_queue.get_hash()
+    print(f"File hash (computed during read): {computed_hash}")
+    
+    # Verify against expected hash
+    expected_hash = "abc123..."  # From S3 metadata
+    if computed_hash == expected_hash:
+        print("Integrity verified!")
+
+# Run both in parallel
+threading.Thread(target=download_from_s3).start()
+threading.Thread(target=verify_and_save).start()
 ```
 
 ## Why This Pattern?
